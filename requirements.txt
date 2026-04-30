@@ -1,0 +1,11 @@
+altair
+pandas
+numpy
+scikit-learn==1.8.0
+streamlit
+plotly
+psycopg2-binary
+python-dotenv
+mlflow
+SQLAlchemy
+alembic

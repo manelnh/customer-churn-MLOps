@@ -1,0 +1,8 @@
+<svg width="600" height="120" viewBox="0 0 600 120" xmlns="http://www.w3.org/2000/svg">
+  <rect width="600" height="120" rx="20" fill="#0d6efd"/>
+  <circle cx="100" cy="60" r="32" fill="#20c997"/>
+  <path d="M170 35 L230 35 L260 80 L200 80 Z" fill="#ffffff"/>
+  <path d="M325 30 L375 30 L420 90 L365 90 Z" fill="#ffffff"/>
+  <path d="M455 45 L520 45 L520 75 L455 75 Z" fill="#20c997"/>
+  <text x="65" y="90" font-family="Arial, Helvetica, sans-serif" font-size="32" fill="white">ChurnLab</text>
+</svg>
