@@ -9,11 +9,24 @@ on:
         description: Why this training run is being launched
         required: false
         default: manual_dispatch
+      profile:
+        description: Training profile to run
+        required: false
+        default: quick
+
+concurrency:
+  group: remote-training
+  cancel-in-progress: false
 
 jobs:
   train-and-register:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+      MLFLOW_EXPERIMENT_NAME: ${{ secrets.MLFLOW_EXPERIMENT_NAME || 'churn_prediction' }}
+      TRAINING_PROFILE: ${{ github.event.inputs.profile || vars.TRAINING_PROFILE || 'quick' }}
+      TRAINING_REASON: ${{ github.event.inputs.reason || 'scheduled_weekly_retraining' }}
 
     steps:
       - name: Check out repository
@@ -32,20 +45,20 @@ jobs:
           pip install -r requirements.txt
 
       - name: Validate required secrets
-        env:
-          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
         run: |
           if [ -z "$MLFLOW_TRACKING_URI" ]; then
             echo "MLFLOW_TRACKING_URI is not configured."
+            echo "This workflow requires an externally reachable MLflow service."
             exit 1
           fi
 
-      - name: Run scheduled training pipeline
-        env:
-          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
-          MLFLOW_EXPERIMENT_NAME: ${{ secrets.MLFLOW_EXPERIMENT_NAME || 'churn_prediction' }}
+      - name: Check MLflow reachability
         run: |
-          python Scripts/run_training.py --reason "${{ github.event.inputs.reason || 'scheduled_run' }}"
+          python -c "import os, urllib.request; urllib.request.urlopen(os.environ['MLFLOW_TRACKING_URI'], timeout=20); print('MLflow reachable')"
+
+      - name: Run training pipeline
+        run: |
+          python Scripts/run_training.py --reason "$TRAINING_REASON" --profile "$TRAINING_PROFILE"
 
       - name: Upload trained bundles
         uses: actions/upload-artifact@v4
@@ -55,3 +68,13 @@ jobs:
             models/churn_production_bundle.pkl
             churn_production.pkl
           if-no-files-found: warn
+
+      - name: Write workflow summary
+        run: |
+          {
+            echo "## Remote Training Summary"
+            echo ""
+            echo "- Reason: \`$TRAINING_REASON\`"
+            echo "- Profile: \`$TRAINING_PROFILE\`"
+            echo "- MLflow URI: \`$MLFLOW_TRACKING_URI\`"
+          } >> "$GITHUB_STEP_SUMMARY"

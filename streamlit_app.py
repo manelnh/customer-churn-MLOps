@@ -1,5 +1,5 @@
 """
-TeleLink Churn Prediction - Managerial Decision Support System
+TelCo Churn Prediction - Managerial Decision Support System
 ===============================================================
 A Streamlit MLOps dashboard for customer churn prediction with executive insights,
 actionable recommendations, and technical model governance.
@@ -8,7 +8,11 @@ actionable recommendations, and technical model governance.
 import os
 import sys
 import json
+import base64
 import logging
+import subprocess
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 import warnings
 from pathlib import Path
 
@@ -28,7 +32,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # Import local modules
 from Scripts.db_utils import (
     get_postgres_connection,
-    ensure_platform_tables,
+    bootstrap_platform_tables_if_enabled,
     insert_prediction_log,
     insert_governance_decision,
     update_prediction_ground_truth,
@@ -38,7 +42,14 @@ from Scripts.db_utils import (
     fetch_recent_governance_decisions as load_governance_decisions,
 )
 from Scripts.model_utils import (
+    DEFAULT_DECISION_THRESHOLD,
+    calculate_model_selection_score,
+    classify_from_probability,
+    filter_predictions_for_active_model,
+    get_active_bundle_metadata,
+    get_baseline_metrics_from_metadata,
     load_model_bundle,
+    load_bundle,
     prepare_customer_features,
     get_risk_label,
     calculate_live_metrics,
@@ -64,21 +75,72 @@ PRODUCTION_BASELINE_METRICS = get_production_baseline_metrics()
 PRODUCTION_BASELINE_PARAMS = get_production_baseline_params()
 FORM_SOURCE = 'streamlit_ui'
 
+
+def get_bundle_metadata() -> dict:
+    metadata = get_active_bundle_metadata()
+    if metadata:
+        return metadata
+
+    candidate_paths = [ROOT_DIR / 'churn_production.pkl', ROOT_DIR / 'models' / 'churn_production_bundle.pkl']
+    for path in candidate_paths:
+        if path.exists():
+            try:
+                return load_bundle(path).get('metadata', {})
+            except Exception:
+                continue
+    return {}
+
 # --- Custom Styling ---
 def inject_custom_style():
     st.markdown(
         """
         <style>
         .main-header {
-            font-size: 2.2rem;
-            font-weight: 700;
-            color: #0f62a8;
-            margin-bottom: 0.5rem;
+            font-size: 2.35rem;
+            font-weight: 800;
+            color: #0f3057;
+            margin: 0;
+            letter-spacing: -0.03em;
         }
         .sub-header {
             font-size: 1.4rem;
             font-weight: 600;
             color: #1d3557;
+        }
+        .hero-title-wrap {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 0.75rem;
+            padding: 0.95rem 1.15rem;
+            background: linear-gradient(135deg, rgba(240, 247, 255, 0.95) 0%, rgba(226, 239, 255, 0.9) 100%);
+            border: 1px solid rgba(15, 98, 168, 0.14);
+            border-radius: 16px;
+            box-shadow: 0 10px 28px rgba(15, 48, 87, 0.08);
+        }
+        .hero-title-icon {
+            width: 56px;
+            height: 56px;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.9rem;
+            background: linear-gradient(135deg, #0f62a8 0%, #3aa0d8 100%);
+            color: white;
+            flex-shrink: 0;
+            box-shadow: 0 10px 20px rgba(15, 98, 168, 0.22);
+        }
+        .hero-title-copy {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+        .hero-title-subtitle {
+            color: #5f6f82;
+            font-size: 1rem;
+            font-weight: 500;
+            letter-spacing: 0.01em;
         }
         .metric-card {
             background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
@@ -167,13 +229,253 @@ def load_dataset() -> pd.DataFrame:
 def load_platform_data():
     connection = get_postgres_connection()
     try:
-        ensure_platform_tables(connection)
+        bootstrap_platform_tables_if_enabled(connection)
         predictions = load_prediction_logs(connection)
         alerts_df = load_alerts(connection)
         governance_df = load_governance_decisions(connection)
         return predictions, alerts_df, governance_df
     finally:
         connection.close()
+
+
+def get_github_training_dispatch_config() -> dict:
+    return {
+        'token': os.getenv('GITHUB_ACTIONS_TOKEN', '').strip(),
+        'repository': os.getenv('GITHUB_REPOSITORY', '').strip(),
+        'workflow': os.getenv('GITHUB_TRAINING_WORKFLOW', 'training.yml').strip(),
+        'ref': os.getenv('GITHUB_WORKFLOW_REF', 'main').strip(),
+    }
+
+
+def get_github_monitoring_dispatch_config() -> dict:
+    config = get_github_training_dispatch_config().copy()
+    config['workflow'] = os.getenv('GITHUB_MONITORING_WORKFLOW', 'monitoring.yml').strip()
+    return config
+
+
+def get_automation_execution_mode() -> str:
+    mode = os.getenv('AUTOMATION_EXECUTION_MODE', 'auto').strip().lower()
+    return mode if mode in {'auto', 'github', 'local'} else 'auto'
+
+
+def is_github_api_ready() -> bool:
+    config = get_github_training_dispatch_config()
+    return bool(config['token'] and config['repository'])
+
+
+def is_github_training_dispatch_ready() -> bool:
+    config = get_github_training_dispatch_config()
+    return all([config['token'], config['repository'], config['workflow'], config['ref']])
+
+
+def is_github_monitoring_dispatch_ready() -> bool:
+    config = get_github_monitoring_dispatch_config()
+    return all([config['token'], config['repository'], config['workflow'], config['ref']])
+
+
+def build_github_api_headers() -> dict:
+    config = get_github_training_dispatch_config()
+    return {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': f'Bearer {config["token"]}',
+        'User-Agent': 'TeleLink-Streamlit-MLOps-App',
+    }
+
+
+def fetch_latest_github_workflow_run(workflow_file: str) -> dict | None:
+    if not is_github_api_ready():
+        return None
+
+    config = get_github_training_dispatch_config()
+    url = (
+        f'https://api.github.com/repos/{config["repository"]}/actions/workflows/'
+        f'{workflow_file}/runs?per_page=1'
+    )
+    request = urllib_request.Request(
+        url,
+        method='GET',
+        headers=build_github_api_headers(),
+    )
+
+    try:
+        with urllib_request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        runs = payload.get('workflow_runs', [])
+        if not runs:
+            return {
+                'workflow': workflow_file,
+                'status': 'no_runs',
+                'conclusion': '',
+                'created_at': '',
+                'html_url': '',
+            }
+        run = runs[0]
+        return {
+            'workflow': workflow_file,
+            'status': run.get('status', 'unknown'),
+            'conclusion': run.get('conclusion') or '',
+            'created_at': run.get('created_at') or '',
+            'html_url': run.get('html_url') or '',
+            'event': run.get('event') or '',
+            'run_number': run.get('run_number') or '',
+        }
+    except Exception as error:
+        return {
+            'workflow': workflow_file,
+            'status': 'api_error',
+            'conclusion': '',
+            'created_at': '',
+            'html_url': '',
+            'error': str(error),
+        }
+
+
+def get_recent_github_workflow_runs() -> list[dict]:
+    workflow_files = ['ci.yml', 'cd.yml', 'training.yml', 'monitoring.yml']
+    runs = []
+    for workflow in workflow_files:
+        run = fetch_latest_github_workflow_run(workflow)
+        if run is not None:
+            runs.append(run)
+    return runs
+
+
+def trigger_github_workflow_dispatch(config: dict, inputs: dict, workflow_label: str) -> tuple[bool, str]:
+    required_values = [config.get('token'), config.get('repository'), config.get('workflow'), config.get('ref')]
+    if not all(required_values):
+        return False, (
+            f'GitHub Actions dispatch is not configured for {workflow_label}. '
+            'Set GITHUB_ACTIONS_TOKEN, GITHUB_REPOSITORY, the workflow filename, and GITHUB_WORKFLOW_REF.'
+        )
+
+    owner_repo = config['repository']
+    workflow = config['workflow']
+    url = f'https://api.github.com/repos/{owner_repo}/actions/workflows/{workflow}/dispatches'
+    payload = json.dumps(
+        {
+            'ref': config['ref'],
+            'inputs': inputs,
+        }
+    ).encode('utf-8')
+    request = urllib_request.Request(
+        url,
+        data=payload,
+        method='POST',
+        headers={
+            'Accept': 'application/vnd.github+json',
+            'Authorization': f'Bearer {config["token"]}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'TeleLink-Streamlit-MLOps-App',
+        },
+    )
+
+    try:
+        with urllib_request.urlopen(request, timeout=20) as response:
+            status_code = getattr(response, 'status', response.getcode())
+        if status_code in (200, 201, 204):
+            return True, (
+                f'GitHub Actions {workflow_label} workflow "{workflow}" was dispatched successfully '
+                f'for repository "{owner_repo}" on ref "{config["ref"]}".'
+            )
+        return False, f'GitHub API returned unexpected status code {status_code}.'
+    except urllib_error.HTTPError as error:
+        body = error.read().decode('utf-8', errors='ignore')
+        if error.code == 422 and 'Unexpected inputs provided' in body:
+            return False, (
+                f'GitHub {workflow_label} workflow dispatch failed with HTTP 422: {body} '
+                f'This usually means the workflow file "{workflow}" on ref "{config["ref"]}" '
+                f'in repository "{owner_repo}" does not declare the inputs this app is sending yet. '
+                'Push the updated workflow file to that branch/ref, confirm the workflow filename matches, '
+                'or change GITHUB_WORKFLOW_REF to the branch that already contains the new workflow_dispatch inputs.'
+            )
+        return False, f'GitHub {workflow_label} workflow dispatch failed with HTTP {error.code}: {body or error.reason}'
+    except urllib_error.URLError as error:
+        return False, f'Unable to reach GitHub Actions API: {error.reason}'
+    except Exception as error:
+        return False, f'Unexpected GitHub {workflow_label} workflow dispatch error: {error}'
+
+
+def trigger_github_training_workflow(reason: str, profile: str = 'quick') -> tuple[bool, str]:
+    return trigger_github_workflow_dispatch(
+        config=get_github_training_dispatch_config(),
+        inputs={
+            'reason': reason,
+            'profile': profile,
+        },
+        workflow_label='training',
+    )
+
+
+def trigger_github_monitoring_workflow(
+    days: int = 14,
+    threshold: int = 2,
+    auto_retrain: bool = True,
+    profile: str = 'quick',
+) -> tuple[bool, str]:
+    return trigger_github_workflow_dispatch(
+        config=get_github_monitoring_dispatch_config(),
+        inputs={
+            'days': str(days),
+            'threshold': str(threshold),
+            'auto_retrain': 'true' if auto_retrain else 'false',
+            'profile': profile,
+        },
+        workflow_label='monitoring',
+    )
+
+
+def launch_local_training_pipeline(reason: str, profile: str = 'quick') -> tuple[bool, str]:
+    command = [
+        sys.executable,
+        str(ROOT_DIR / 'Scripts' / 'run_training.py'),
+        '--reason',
+        reason,
+        '--profile',
+        profile,
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    combined_output = '\n'.join(part for part in [completed.stdout, completed.stderr] if part).strip()
+    return completed.returncode == 0, combined_output
+
+
+def launch_training_pipeline(reason: str, profile: str = 'quick', execution_mode: str = 'auto') -> tuple[bool, str]:
+    execution_mode = execution_mode or get_automation_execution_mode()
+    if execution_mode == 'github':
+        return trigger_github_training_workflow(reason=reason, profile=profile)
+    if execution_mode == 'local':
+        return launch_local_training_pipeline(reason=reason, profile=profile)
+    if is_github_training_dispatch_ready():
+        return trigger_github_training_workflow(reason=reason, profile=profile)
+    return launch_local_training_pipeline(reason=reason, profile=profile)
+
+
+def launch_monitoring_pipeline(
+    days: int = 14,
+    threshold: int = 2,
+    auto_retrain: bool = True,
+    profile: str = 'quick',
+    execution_mode: str = 'auto',
+) -> tuple[bool, str]:
+    execution_mode = execution_mode or get_automation_execution_mode()
+    if execution_mode == 'github':
+        return trigger_github_monitoring_workflow(
+            days=days,
+            threshold=threshold,
+            auto_retrain=auto_retrain,
+            profile=profile,
+        )
+    if execution_mode == 'auto' and is_github_monitoring_dispatch_ready():
+        return trigger_github_monitoring_workflow(
+            days=days,
+            threshold=threshold,
+            auto_retrain=auto_retrain,
+            profile=profile,
+        )
+    return False, 'Remote monitoring dispatch is disabled because the selected execution mode is not GitHub.'
+
+
+def count_high_severity_alerts(alerts: list[dict]) -> int:
+    return sum(1 for alert in alerts if alert.get('severity') == 'high')
 
 
 def prepare_monitoring_dataframe(predictions: pd.DataFrame) -> pd.DataFrame:
@@ -210,21 +512,63 @@ def get_repo_health_snapshot() -> dict:
 
 
 def get_runtime_configuration_snapshot() -> pd.DataFrame:
+    github_dispatch_ready = is_github_training_dispatch_ready()
+    github_monitoring_ready = is_github_monitoring_dispatch_ready()
+    github_config = get_github_training_dispatch_config()
+    monitoring_config = get_github_monitoring_dispatch_config()
     rows = [
         {'Setting': 'MLflow Tracking URI', 'Value': get_mlflow_tracking_uri()},
         {'Setting': 'MLflow Experiment', 'Value': get_mlflow_experiment_name()},
         {'Setting': 'Postgres Host', 'Value': os.getenv('POSTGRES_HOST', 'db')},
         {'Setting': 'Postgres Port', 'Value': os.getenv('POSTGRES_PORT', '5432')},
+        {'Setting': 'Automation Execution Mode', 'Value': get_automation_execution_mode()},
+        {'Setting': 'GitHub Training Dispatch', 'Value': 'Ready' if github_dispatch_ready else 'Not Configured'},
+        {'Setting': 'GitHub Monitoring Dispatch', 'Value': 'Ready' if github_monitoring_ready else 'Not Configured'},
+        {'Setting': 'GitHub Repository', 'Value': github_config['repository'] or 'Not set'},
+        {'Setting': 'GitHub Training Workflow', 'Value': github_config['workflow'] or 'Not set'},
+        {'Setting': 'GitHub Monitoring Workflow', 'Value': monitoring_config['workflow'] or 'Not set'},
+        {'Setting': 'GitHub Workflow Ref', 'Value': github_config['ref'] or 'Not set'},
         {'Setting': 'Env Example Present', 'Value': 'Yes' if (ROOT_DIR / '.env.example').exists() else 'No'},
     ]
     return pd.DataFrame(rows)
+
+
+def render_github_workflow_status_panel():
+    st.markdown('### Recent GitHub Workflow Runs')
+    if not is_github_api_ready():
+        st.info('Configure `GITHUB_ACTIONS_TOKEN` and `GITHUB_REPOSITORY` to show recent CI/CD workflow run status inside the app.')
+        return
+
+    workflow_runs = get_recent_github_workflow_runs()
+    if not workflow_runs:
+        st.info('No GitHub workflow run information is available yet.')
+        return
+
+    run_rows = []
+    for run in workflow_runs:
+        status = run.get('status', 'unknown')
+        conclusion = run.get('conclusion') or '-'
+        created_at = run.get('created_at') or '-'
+        run_rows.append(
+            {
+                'Workflow': run.get('workflow', '-'),
+                'Status': status,
+                'Conclusion': conclusion,
+                'Created At': created_at,
+                'Run Number': run.get('run_number') or '-',
+                'Event': run.get('event') or '-',
+            }
+        )
+        if run.get('status') == 'api_error':
+            st.warning(f'Unable to read `{run.get("workflow")}` workflow status: {run.get("error", "unknown error")}')
+
+    st.dataframe(pd.DataFrame(run_rows), width='stretch', hide_index=True)
 
 
 def render_mlops_sidebar_status():
     snapshot = get_repo_health_snapshot()
     workflow_count = sum(snapshot['workflows'].values())
     st.markdown('### MLOps Status')
-    st.caption('Additive status panel for the new automation pieces.')
     st.metric('Automation Workflows', f'{workflow_count}/4')
     st.metric('Model Bundles Found', snapshot['bundle_count'])
     st.write(f"Alembic ready: `{'Yes' if snapshot['has_alembic'] else 'No'}`")
@@ -239,11 +583,12 @@ def render_delivery_readiness_panel():
     runtime_df = get_runtime_configuration_snapshot()
 
     st.markdown('### CI/CD And Registry Readiness')
-    readiness_cols = st.columns(4)
+    readiness_cols = st.columns(5)
     readiness_cols[0].metric('CI', 'Ready' if snapshot['workflows'].get('CI') else 'Missing')
     readiness_cols[1].metric('CD', 'Ready' if snapshot['workflows'].get('CD') else 'Missing')
     readiness_cols[2].metric('Migrations', 'Ready' if snapshot['has_alembic'] else 'Missing')
     readiness_cols[3].metric('Bundles', snapshot['bundle_count'])
+    readiness_cols[4].metric('GitHub Retrain', 'Ready' if is_github_training_dispatch_ready() else 'Local Only')
 
     if snapshot['latest_bundle_name']:
         st.caption(f"Latest local production bundle: `{snapshot['latest_bundle_name']}`")
@@ -254,36 +599,109 @@ def render_delivery_readiness_panel():
     with info_col:
         st.info(
             'This panel helps you verify whether the repo contains the pieces expected for GitHub CI/CD, '
-            'scheduled retraining, scheduled monitoring, and release readiness.'
+            'manual retraining, manual monitoring, and release readiness.'
         )
         if not snapshot['git_repo_present']:
             st.warning('No local `.git` directory was detected in this workspace. Push the project from a real Git repository to activate GitHub Actions.')
     with table_col:
-        st.dataframe(runtime_df, use_container_width=True, hide_index=True)
+        st.dataframe(runtime_df, width='stretch', hide_index=True)
+    render_github_workflow_status_panel()
+
+
+def render_cicd_story_panel():
+    snapshot = get_repo_health_snapshot()
+    github_ready = is_github_training_dispatch_ready()
+
+    st.markdown('### CI/CD Overview')
+    st.caption(
+        'This section summarizes how validation, deployment, monitoring, and retraining are connected in the project workflow.'
+    )
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric('CI', 'Active' if snapshot['workflows'].get('CI') else 'Missing')
+    summary_cols[1].metric('CD', 'Active' if snapshot['workflows'].get('CD') else 'Missing')
+    summary_cols[2].metric('Monitoring Job', 'Active' if snapshot['workflows'].get('Monitoring') else 'Missing')
+    default_mode = get_automation_execution_mode()
+    if default_mode == 'github':
+        retraining_path = 'GitHub Only'
+    elif github_ready:
+        retraining_path = 'GitHub Preferred'
+    else:
+        retraining_path = 'Local Fallback'
+    summary_cols[3].metric('Retraining Path', retraining_path)
+
+    flow_cols = st.columns(4)
+    flow_cols[0].info(
+        '1. Build Quality\n\n'
+        'Every push or pull request goes through CI checks: linting, test execution, coverage, and Docker build validation.'
+    )
+    flow_cols[1].info(
+        '2. Delivery\n\n'
+        'After validation, CD packages the application into a deployable container so the delivered version matches a reviewed Git commit.'
+    )
+    flow_cols[2].info(
+        '3. Operations\n\n'
+        'This Streamlit app logs production evidence to PostgreSQL, and the monitoring workflow turns that evidence into health alerts.'
+    )
+    flow_cols[3].info(
+        '4. Continuous Improvement\n\n'
+        'When monitoring shows enough risk, retraining can be launched on GitHub runners and tracked in MLflow without depending on your local machine.'
+    )
+
+    benefit_cols = st.columns(3)
+    benefit_cols[0].success(
+        'Reproducibility\n\n'
+        'Training, testing, and packaging run the same way each time instead of depending on one machine.'
+    )
+    benefit_cols[1].success(
+        'Auditability\n\n'
+        'Model changes, monitoring runs, and release steps leave a visible execution trail for reviewers and teams.'
+    )
+    benefit_cols[2].success(
+        'Production Credibility\n\n'
+        'The project demonstrates an operational ML system, not only a prediction interface or notebook result.'
+    )
+
+    render_delivery_readiness_panel()
 
 
 def render_automation_quick_guide():
-    st.markdown('### Automation Quick Guide')
+    st.markdown('### Automation Flow')
     guide_cols = st.columns(3)
     guide_cols[0].info(
         '1. CI\n\nPush the repo to GitHub. Every push or pull request will run lint, tests, coverage, and Docker build validation.'
     )
     guide_cols[1].info(
-        '2. Training\n\nUse the Training workflow manually or on schedule to run `Scripts/run_training.py` and create updated MLflow runs and bundles.'
+        '2. Training\n\nUse the scheduled Training workflow or the in-app GitHub dispatch controls to retrain on GitHub runners and create updated MLflow runs and bundles.'
     )
     guide_cols[2].info(
-        '3. Monitoring\n\nUse the Monitoring workflow or the in-app monitoring button to refresh alerts and review production evidence.'
+        '3. Monitoring\n\nUse the scheduled Monitoring workflow or the in-app GitHub dispatch controls to evaluate production evidence and trigger remote retraining when needed.'
     )
 
 
 def render_header():
+    hero_image_path = ROOT_DIR / 'assets' / 'telco_churn_prediction.png'
+    if hero_image_path.exists():
+        hero_image_base64 = base64.b64encode(hero_image_path.read_bytes()).decode('utf-8')
+        st.markdown(
+            f"""
+            <div style="width:100%;margin-bottom:1rem;">
+                <img
+                    src="data:image/png;base64,{hero_image_base64}"
+                    alt="TelCo Churn dashboard hero"
+                    style="width:100%;max-height:500px;object-fit:cover;object-position:center 46%;display:block;border-radius:18px;"
+                />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     st.markdown(
         """
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:0.5rem;">
-            <span style="font-size:2.5rem;">📊</span>
-            <div>
-                <div class="main-header">TeleLink Churn Prediction</div>
-                <div style="color:#6c757d;font-size:1rem;">Managerial Decision Support System</div>
+        <div class="hero-title-wrap">
+            <div class="hero-title-icon">&#128202;</div>
+            <div class="hero-title-copy">
+                <div class="main-header">TelCo Churn Prediction</div>
+                <div class="hero-title-subtitle">Managerial Decision Support System</div>
             </div>
         </div>
         """,
@@ -606,12 +1024,14 @@ def build_demo_customer_profiles() -> list[dict]:
 
 
 def seed_demo_predictions(connection, model, dv, scaler) -> int:
+    bundle_metadata = get_bundle_metadata()
+    decision_threshold = float(bundle_metadata.get('decision_threshold', DEFAULT_DECISION_THRESHOLD))
     inserted_count = 0
     for customer_data in build_demo_customer_profiles():
         X_scaled, _ = prepare_customer_features(customer_data, dv, scaler)
         probability = float(model.predict_proba(X_scaled)[0, 1])
         risk_label, _ = get_risk_label(probability)
-        predicted_label = 'Churn' if probability >= 0.5 else 'No churn'
+        predicted_label = classify_from_probability(probability, threshold=decision_threshold)
         top_drivers = serialize_top_drivers(explain_top_drivers(X_scaled, model, dv))
         insert_prediction_log(
             connection,
@@ -620,10 +1040,11 @@ def seed_demo_predictions(connection, model, dv, scaler) -> int:
             predicted_label=predicted_label,
             predicted_risk=risk_label,
             top_drivers=top_drivers,
-            model_name='logistic_regression',
-            model_version='C100_lbfgs_l2',
+            model_name=str(bundle_metadata.get('model_family', 'logistic_regression')),
+            model_version=str(bundle_metadata.get('variant_name', 'logistic_regression')),
             model_stage='Production',
             source='demo_seed',
+            mlflow_run_id=bundle_metadata.get('mlflow_run_id') or bundle_metadata.get('run_id'),
         )
         inserted_count += 1
     return inserted_count
@@ -821,17 +1242,17 @@ def render_demography_analysis(df: pd.DataFrame):
     col1, col2 = st.columns(2)
     with col1:
         if 'gender' in df.columns:
-            st.plotly_chart(build_churn_rate_chart(df, 'gender', 'Churn Rate by Gender', ['#0f62a8', '#8da9c4']), use_container_width=True)
+            st.plotly_chart(build_churn_rate_chart(df, 'gender', 'Churn Rate by Gender', ['#0f62a8', '#8da9c4']), width='stretch')
         elif 'Gender' in df.columns:
-            st.plotly_chart(build_churn_rate_chart(df, 'Gender', 'Churn Rate by Gender', ['#0f62a8', '#8da9c4']), use_container_width=True)
+            st.plotly_chart(build_churn_rate_chart(df, 'Gender', 'Churn Rate by Gender', ['#0f62a8', '#8da9c4']), width='stretch')
     with col2:
         senior_col = 'SeniorCitizen' if 'SeniorCitizen' in df.columns else None
         if senior_col:
             senior_df = df.copy()
             senior_df[senior_col] = senior_df[senior_col].replace({1: 'Yes', 0: 'No'})
-            st.plotly_chart(build_churn_rate_chart(senior_df, senior_col, 'Churn Rate by Senior Citizen Status', ['#f4a261', '#2a9d8f']), use_container_width=True)
+            st.plotly_chart(build_churn_rate_chart(senior_df, senior_col, 'Churn Rate by Senior Citizen Status', ['#f4a261', '#2a9d8f']), width='stretch')
     if 'Dependents' in df.columns:
-        st.plotly_chart(build_churn_rate_chart(df, 'Dependents', 'Churn Rate by Dependents', ['#457b9d', '#a8dadc']), use_container_width=True)
+        st.plotly_chart(build_churn_rate_chart(df, 'Dependents', 'Churn Rate by Dependents', ['#457b9d', '#a8dadc']), width='stretch')
 
 
 def render_services_analysis(df: pd.DataFrame):
@@ -839,22 +1260,22 @@ def render_services_analysis(df: pd.DataFrame):
     col1, col2 = st.columns(2)
     with col1:
         if 'InternetService' in df.columns:
-            st.plotly_chart(build_churn_rate_chart(df, 'InternetService', 'Churn Rate by Internet Service', ['#f4a261', '#e76f51', '#2a9d8f']), use_container_width=True)
+            st.plotly_chart(build_churn_rate_chart(df, 'InternetService', 'Churn Rate by Internet Service', ['#f4a261', '#e76f51', '#2a9d8f']), width='stretch')
         service_columns = [col for col in ['OnlineSecurity', 'OnlineBackup', 'DeviceProtection'] if col in df.columns]
         if service_columns:
             melted = df.melt(id_vars=['Churn'], value_vars=service_columns, var_name='service', value_name='enabled')
             service_chart = px.histogram(melted, x='service', color='enabled', barmode='group',
                                          title='Adoption of Core Protection Services', color_discrete_map={'Yes': '#0f62a8', 'No': '#d62839'})
             service_chart.update_layout(height=360)
-            st.plotly_chart(service_chart, use_container_width=True)
+            st.plotly_chart(service_chart, width='stretch')
     with col2:
         stream_columns = [col for col in ['StreamingTV', 'StreamingMovies'] if col in df.columns]
         if stream_columns:
             stream_df = df.copy()
             stream_df['StreamingBundle'] = stream_df[stream_columns].apply(lambda row: 'Enabled' if 'Yes' in row.values else 'Disabled', axis=1)
-            st.plotly_chart(build_churn_rate_chart(stream_df, 'StreamingBundle', 'Churn Rate by Streaming Bundle', ['#1d3557', '#a8dadc']), use_container_width=True)
+            st.plotly_chart(build_churn_rate_chart(stream_df, 'StreamingBundle', 'Churn Rate by Streaming Bundle', ['#1d3557', '#a8dadc']), width='stretch')
         if 'PaperlessBilling' in df.columns:
-            st.plotly_chart(build_churn_rate_chart(df, 'PaperlessBilling', 'Churn Rate by Paperless Billing', ['#577590', '#90be6d']), use_container_width=True)
+            st.plotly_chart(build_churn_rate_chart(df, 'PaperlessBilling', 'Churn Rate by Paperless Billing', ['#577590', '#90be6d']), width='stretch')
 
 
 def render_billing_analysis(df: pd.DataFrame):
@@ -862,19 +1283,19 @@ def render_billing_analysis(df: pd.DataFrame):
     col1, col2 = st.columns(2)
     with col1:
         if 'Contract' in df.columns:
-            st.plotly_chart(build_churn_rate_chart(df, 'Contract', 'Churn Rate by Contract Type', ['#0f62a8', '#4ea8de', '#8da9c4']), use_container_width=True)
+            st.plotly_chart(build_churn_rate_chart(df, 'Contract', 'Churn Rate by Contract Type', ['#0f62a8', '#4ea8de', '#8da9c4']), width='stretch')
         if 'PaymentMethod' in df.columns:
             payment_chart = build_churn_rate_chart(df, 'PaymentMethod', 'Churn Rate by Payment Method', ['#1d3557', '#457b9d', '#a8dadc', '#e9c46a'])
             payment_chart.update_layout(xaxis_tickangle=-25)
-            st.plotly_chart(payment_chart, use_container_width=True)
+            st.plotly_chart(payment_chart, width='stretch')
     with col2:
         if 'MonthlyCharges' in df.columns:
-            st.plotly_chart(build_distribution_chart(df, 'MonthlyCharges', 'Monthly Charges Distribution by Churn'), use_container_width=True)
+            st.plotly_chart(build_distribution_chart(df, 'MonthlyCharges', 'Monthly Charges Distribution by Churn'), width='stretch')
         if 'MonthlyCharges' in df.columns and 'tenure' in df.columns:
             scatter_plot = px.scatter(df, x='tenure', y='MonthlyCharges', color='Churn', title='Tenure vs Monthly Charges',
                                       color_discrete_map={'Yes': '#d62839', 'No': '#2a9d8f'}, opacity=0.65)
             scatter_plot.update_layout(height=360)
-            st.plotly_chart(scatter_plot, use_container_width=True)
+            st.plotly_chart(scatter_plot, width='stretch')
 
 
 def render_tenure_analysis(df: pd.DataFrame):
@@ -882,34 +1303,34 @@ def render_tenure_analysis(df: pd.DataFrame):
     col1, col2 = st.columns(2)
     with col1:
         if 'tenure' in df.columns:
-            st.plotly_chart(build_distribution_chart(df, 'tenure', 'Tenure Distribution by Churn'), use_container_width=True)
+            st.plotly_chart(build_distribution_chart(df, 'tenure', 'Tenure Distribution by Churn'), width='stretch')
         tenure_bucket_df = df.groupby('TenureBucket', dropna=False)['Churn_Binary'].mean().reset_index(name='churn_rate')
         tenure_bucket_chart = px.line(tenure_bucket_df, x='TenureBucket', y='churn_rate', markers=True,
                                        title='Churn Rate by Tenure Bucket', color_discrete_sequence=['#0f62a8'])
         tenure_bucket_chart.update_layout(height=360, yaxis_tickformat='.0%')
-        st.plotly_chart(tenure_bucket_chart, use_container_width=True)
+        st.plotly_chart(tenure_bucket_chart, width='stretch')
     with col2:
         if 'Data_Usage_GB' in df.columns:
             usage_chart = px.histogram(df, x='Data_Usage_GB', color='Churn', barmode='overlay', opacity=0.72,
                                        title='Data Usage Distribution by Churn', color_discrete_map={'Yes': '#d62839', 'No': '#2a9d8f'})
             usage_chart.update_layout(height=360)
-            st.plotly_chart(usage_chart, use_container_width=True)
+            st.plotly_chart(usage_chart, width='stretch')
         if 'Usage_per_Month' in df.columns:
             usage_tenure_chart = px.scatter(df, x='tenure', y='Usage_per_Month', color='Churn', title='Tenure vs Usage Per Month',
                                             color_discrete_map={'Yes': '#d62839', 'No': '#2a9d8f'}, opacity=0.65)
             usage_tenure_chart.update_layout(height=360)
-            st.plotly_chart(usage_tenure_chart, use_container_width=True)
+            st.plotly_chart(usage_tenure_chart, width='stretch')
 
 
 def render_geography_analysis(df: pd.DataFrame):
     st.markdown('### 🗺️ Geography')
     if 'Gouvernorat' in df.columns:
-        st.plotly_chart(build_geo_churn_chart(df), use_container_width=True)
+        st.plotly_chart(build_geo_churn_chart(df), width='stretch')
 
 
 def render_correlation_analysis(df: pd.DataFrame):
     st.markdown('### 🛠️ Feature Correlations')
-    st.plotly_chart(build_correlation_heatmap(df), use_container_width=True)
+    st.plotly_chart(build_correlation_heatmap(df), width='stretch')
 
 
 # ============================================================
@@ -918,7 +1339,7 @@ def render_correlation_analysis(df: pd.DataFrame):
 
 def render_single_prediction_tab(model, dv, scaler):
     """Single Prediction Tab - Run production model on customer data"""
-    st.subheader('📋 Single Prediction')
+    st.subheader('📋 Predictions')
     st.caption('Run the production logistic regression model, explain the result with top drivers, and log the inference event to PostgreSQL.')
 
     with st.form('single_prediction_form', clear_on_submit=False):
@@ -929,10 +1350,12 @@ def render_single_prediction_tab(model, dv, scaler):
         return
 
     current_model, current_dv, current_scaler = load_model_bundle()
+    bundle_metadata = get_bundle_metadata()
+    decision_threshold = float(bundle_metadata.get('decision_threshold', DEFAULT_DECISION_THRESHOLD))
     X_scaled, _ = prepare_customer_features(customer_data, current_dv, current_scaler)
     probability = float(current_model.predict_proba(X_scaled)[0, 1])
     risk_label, risk_tag = get_risk_label(probability)
-    predicted_label = 'Churn' if probability >= 0.5 else 'No churn'
+    predicted_label = classify_from_probability(probability, threshold=decision_threshold)
     top_drivers_df = explain_top_drivers(X_scaled, current_model, current_dv)
     top_drivers = serialize_top_drivers(top_drivers_df)
 
@@ -941,6 +1364,7 @@ def render_single_prediction_tab(model, dv, scaler):
     metric_cols[0].metric('Churn Probability', f'{probability:.1%}')
     metric_cols[1].metric('Predicted Label', predicted_label)
     metric_cols[2].metric('Risk Tier', risk_label)
+    st.caption(f'Decision threshold in use: {decision_threshold:.2f}')
 
     left_col, right_col = st.columns([0.9, 1.1])
     with left_col:
@@ -958,12 +1382,14 @@ def render_single_prediction_tab(model, dv, scaler):
 
     connection = get_postgres_connection()
     try:
-        ensure_platform_tables(connection)
+        bootstrap_platform_tables_if_enabled(connection)
         prediction_id = insert_prediction_log(
             connection, input_features=customer_data, predicted_probability=probability,
             predicted_label=predicted_label, predicted_risk=risk_label, top_drivers=top_drivers,
-            model_name='logistic_regression', model_version='C100_lbfgs_l2',
+            model_name=str(bundle_metadata.get('model_family', 'logistic_regression')),
+            model_version=str(bundle_metadata.get('variant_name', 'logistic_regression')),
             model_stage='Production', source=FORM_SOURCE,
+            mlflow_run_id=bundle_metadata.get('mlflow_run_id') or bundle_metadata.get('run_id'),
         )
         st.success(f'Prediction stored successfully with record ID `{prediction_id}`.')
     except Exception as error:
@@ -980,7 +1406,12 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
     st.subheader('📊 Manager Insights')
     st.caption('Executive overview of churn risk, revenue exposure, and system health status.')
 
-    monitoring_df = build_decision_support_frame(predictions)
+    active_bundle_metadata = get_bundle_metadata()
+    active_baseline_metrics = get_baseline_metrics_from_metadata(active_bundle_metadata)
+    monitoring_df = build_decision_support_frame(
+        filter_predictions_for_active_model(predictions, active_bundle_metadata)
+    )
+    full_history_monitoring_df = build_decision_support_frame(predictions)
 
     # Calculate KPIs
     if monitoring_df.empty:
@@ -988,12 +1419,13 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
         return
 
     live_metrics = calculate_live_metrics(monitoring_df)
-    computed_alerts = detect_monitoring_alerts(monitoring_df, PRODUCTION_BASELINE_METRICS)
-    high_risk_count = int((monitoring_df['predicted_risk'] == 'HIGH RISK').sum())
-    medium_risk_count = int((monitoring_df['predicted_risk'] == 'MEDIUM RISK').sum())
-    low_risk_count = int((monitoring_df['predicted_risk'] == 'LOW RISK').sum())
+    computed_alerts = detect_monitoring_alerts(monitoring_df, active_baseline_metrics)
+    kpi_df = full_history_monitoring_df.copy()
+    high_risk_count = int((kpi_df['predicted_risk'] == 'HIGH RISK').sum())
+    medium_risk_count = int((kpi_df['predicted_risk'] == 'MEDIUM RISK').sum())
+    low_risk_count = int((kpi_df['predicted_risk'] == 'LOW RISK').sum())
 
-    avg_monthly_bill = float(monitoring_df['MonthlyCharges'].mean()) if 'MonthlyCharges' in monitoring_df.columns else 0.0
+    avg_monthly_bill = float(kpi_df['MonthlyCharges'].mean()) if 'MonthlyCharges' in kpi_df.columns else 0.0
     revenue_at_risk = high_risk_count * avg_monthly_bill
     model_trust_score = calculate_model_trust_score(computed_alerts)
     recommended_action = get_manager_recommended_action(computed_alerts, high_risk_count)
@@ -1001,8 +1433,8 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
     # Top Governorate
     top_governorate = 'N/A'
     top_gov_churn = 0.0
-    if 'Gouvernorat' in monitoring_df.columns:
-        gov_stats = monitoring_df.groupby('Gouvernorat')['predicted_probability'].mean().sort_values(ascending=False)
+    if 'Gouvernorat' in kpi_df.columns:
+        gov_stats = kpi_df.groupby('Gouvernorat')['predicted_probability'].mean().sort_values(ascending=False)
         if not gov_stats.empty:
             top_governorate = gov_stats.index[0]
             top_gov_churn = gov_stats.iloc[0]
@@ -1047,8 +1479,8 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
     col_chart1, col_chart2 = st.columns(2)
     with col_chart1:
         st.plotly_chart(
-            build_risk_distribution_chart(monitoring_df),
-            use_container_width=True,
+            build_risk_distribution_chart(full_history_monitoring_df),
+            width='stretch',
             key='monitoring_manager_risk_distribution',
         )
     with col_chart2:
@@ -1058,7 +1490,7 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
             {'Risk Level': 'MEDIUM RISK', 'Count': medium_risk_count, 'Revenue Impact': f'${medium_risk_count * avg_monthly_bill * 0.5:,.0f}'},
             {'Risk Level': 'LOW RISK', 'Count': low_risk_count, 'Revenue Impact': '$0'},
         ])
-        st.dataframe(risk_summary, use_container_width=True, hide_index=True)
+        st.dataframe(risk_summary, width='stretch', hide_index=True)
 
     # Recommended Action Banner
     st.markdown('### Recommended Action')
@@ -1094,20 +1526,21 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
 
     st.divider()
     st.markdown('### Decision Operations')
+    ops_df = full_history_monitoring_df.copy()
     ops_cols = st.columns(4)
-    pending_actions = int((monitoring_df['Action Status'] == 'Pending Action').sum())
-    actioned_cases = int((monitoring_df['Action Status'] == 'Action Taken').sum())
-    known_outcomes = int((monitoring_df['Outcome Status'] == 'Outcome Known').sum())
+    pending_actions = int((ops_df['Action Status'] == 'Pending Action').sum())
+    actioned_cases = int((ops_df['Action Status'] == 'Action Taken').sum())
+    known_outcomes = int((ops_df['Outcome Status'] == 'Outcome Known').sum())
     ops_cols[0].metric('Pending Action', pending_actions)
     ops_cols[1].metric('Action Taken', actioned_cases)
     ops_cols[2].metric('Outcome Known', known_outcomes)
     ops_cols[3].metric(
         'Action Coverage',
-        f"{(actioned_cases / max(len(monitoring_df), 1)):.1%}",
+        f"{(actioned_cases / max(len(ops_df), 1)):.1%}",
     )
 
     action_status_df = (
-        monitoring_df.groupby(['predicted_risk', 'Action Status'])
+        ops_df.groupby(['predicted_risk', 'Action Status'])
         .size()
         .reset_index(name='count')
     )
@@ -1124,10 +1557,10 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
             color_discrete_map={'Pending Action': '#d62839', 'Action Taken': '#2a9d8f'},
         )
         status_chart.update_layout(height=360)
-        st.plotly_chart(status_chart, use_container_width=True, key='manager_action_status_chart')
+        st.plotly_chart(status_chart, width='stretch', key='manager_action_status_chart')
     with action_col:
         action_mix_df = (
-            monitoring_df['Manager Action']
+            ops_df['Manager Action']
             .value_counts()
             .rename_axis('Manager Action')
             .reset_index(name='count')
@@ -1140,7 +1573,7 @@ def render_manager_insights_tab(predictions: pd.DataFrame, alerts_df: pd.DataFra
             title='Manager Action Mix',
         )
         action_mix_chart.update_layout(height=360)
-        st.plotly_chart(action_mix_chart, use_container_width=True, key='manager_action_mix_chart')
+        st.plotly_chart(action_mix_chart, width='stretch', key='manager_action_mix_chart')
 
 
 def render_action_center_tab(predictions: pd.DataFrame, model, dv, scaler):
@@ -1197,7 +1630,7 @@ def render_action_center_tab(predictions: pd.DataFrame, model, dv, scaler):
         if st.button('Save Manager Action', type='primary', key=f"manager_action_save_{selected_prediction_id}"):
             connection = get_postgres_connection()
             try:
-                ensure_platform_tables(connection)
+                bootstrap_platform_tables_if_enabled(connection)
                 save_manager_action(connection, int(selected_prediction_id), chosen_action)
                 st.success(f"Manager action saved for prediction #{selected_prediction_id}.")
                 st.rerun()
@@ -1265,7 +1698,7 @@ def render_action_center_tab(predictions: pd.DataFrame, model, dv, scaler):
         .map(style_next_best_action, subset=['Next Best Action'])
         .map(style_managers_action, subset=["Manager's Action"])
     )
-    st.dataframe(styled_df, use_container_width=True)
+    st.dataframe(styled_df, width='stretch')
 
     # Action Summary
     st.markdown('### Action Summary')
@@ -1273,7 +1706,7 @@ def render_action_center_tab(predictions: pd.DataFrame, model, dv, scaler):
     with summary_col:
         action_counts = saved_df["Manager's Action"].value_counts().to_dict()
         summary_df = pd.DataFrame(list(action_counts.items()), columns=['Action', 'Count'])
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width='stretch', hide_index=True)
     with effectiveness_col:
         effectiveness_df = saved_df[saved_df['actual_label'].notna() & saved_df['manager_action'].notna()].copy()
         if effectiveness_df.empty:
@@ -1287,7 +1720,7 @@ def render_action_center_tab(predictions: pd.DataFrame, model, dv, scaler):
                 .sort_values(['retention_rate', 'customers'], ascending=[False, False])
             )
             action_effectiveness['retention_rate'] = action_effectiveness['retention_rate'].map(lambda value: f'{value:.1%}')
-            st.dataframe(action_effectiveness, use_container_width=True, hide_index=True)
+            st.dataframe(action_effectiveness, width='stretch', hide_index=True)
 
 
 def render_technical_lab_tab():
@@ -1301,44 +1734,74 @@ def render_technical_lab_tab():
     with control_col:
         c_exponent = st.slider('log10(C)', min_value=-3.0, max_value=2.0, value=2.0, step=0.1)
         selected_c = round(10 ** c_exponent, 6)
-        selected_solver = st.selectbox('Solver', ['lbfgs', 'liblinear'])
-        selected_penalty = 'l2' if selected_solver == 'lbfgs' else st.selectbox('Penalty', ['l1', 'l2'])
-        class_weight_label = st.selectbox('Class Weight', ['balanced', 'None'])
-        selected_class_weight = None if class_weight_label == 'None' else 'balanced'
+        selected_solver = st.selectbox('Solver', ['lbfgs', 'liblinear', 'saga'])
+        if selected_solver == 'lbfgs':
+            selected_penalty = 'l2'
+        else:
+            penalty_options = ['l1', 'l2']
+            if selected_solver == 'saga':
+                penalty_options.append('elasticnet')
+            selected_penalty = st.selectbox('Penalty', penalty_options)
+        selected_l1_ratio = None
+        if selected_solver == 'saga' and selected_penalty == 'elasticnet':
+            selected_l1_ratio = st.slider('Elastic-Net Mix (l1_ratio)', min_value=0.05, max_value=0.95, value=0.50, step=0.05)
+        class_weight_options = {
+            'balanced': 'balanced',
+            'None': None,
+            'Positive x2': {0: 1, 1: 2},
+            'Positive x3': {0: 1, 1: 3},
+            'Positive x4': {0: 1, 1: 4},
+        }
+        class_weight_label = st.selectbox('Class Weight', list(class_weight_options.keys()))
+        selected_class_weight = class_weight_options[class_weight_label]
+        candidate_params = {
+            'C': selected_c,
+            'solver': selected_solver,
+            'penalty': selected_penalty,
+            'class_weight': selected_class_weight,
+            'l1_ratio': selected_l1_ratio,
+        }
     with summary_col:
         st.info(
             'MLflow is the offline experimentation layer. A candidate only reaches production after governance review. '
             'PostgreSQL then becomes the online evidence layer, capturing how that production model behaves on real inferences.'
         )
+        st.caption('Selection rule: validation F1 is prioritized, then ROC-AUC and accuracy contribute positively, while log loss slightly penalizes unstable candidates.')
 
-    baseline_result = run_lab_experiment_cached(
-        PRODUCTION_BASELINE_PARAMS['C'], PRODUCTION_BASELINE_PARAMS['solver'],
-        PRODUCTION_BASELINE_PARAMS['penalty'], PRODUCTION_BASELINE_PARAMS['class_weight'],
-    )
-    candidate_result = run_lab_experiment_cached(selected_c, selected_solver, selected_penalty, selected_class_weight)
+    baseline_result = run_lab_experiment_cached({
+        'C': PRODUCTION_BASELINE_PARAMS['C'],
+        'solver': PRODUCTION_BASELINE_PARAMS['solver'],
+        'penalty': PRODUCTION_BASELINE_PARAMS['penalty'],
+        'class_weight': PRODUCTION_BASELINE_PARAMS['class_weight'],
+    })
+    candidate_result = run_lab_experiment_cached(candidate_params)
 
     baseline_metrics = baseline_result['metrics']['test']
     candidate_metrics = candidate_result['metrics']['test']
     governance = evaluate_governance_candidate(candidate_metrics, PRODUCTION_BASELINE_METRICS)
+    baseline_selection_score = calculate_model_selection_score(baseline_result['metrics']['val'])
+    candidate_selection_score = calculate_model_selection_score(candidate_result['metrics']['val'])
 
     st.divider()
-    metric_cols = st.columns(3)
-    for column, metric_name, label in zip(metric_cols, ['accuracy', 'f1', 'roc_auc'], ['Accuracy', 'F1-Score', 'ROC-AUC']):
+    metric_cols = st.columns(4)
+    for column, metric_name, label in zip(metric_cols[:3], ['accuracy', 'f1', 'roc_auc'], ['Accuracy', 'F1-Score', 'ROC-AUC']):
         delta_value = candidate_metrics[metric_name] - baseline_metrics[metric_name]
         column.metric(label, f"{candidate_metrics[metric_name]:.3f}", delta=f'{delta_value:+.3f}')
+    metric_cols[3].metric('Selection Score', f'{candidate_selection_score:.3f}', delta=f'{candidate_selection_score - baseline_selection_score:+.3f}')
 
     chart_col, detail_col = st.columns([1.25, 0.75])
     with chart_col:
-        st.plotly_chart(build_metric_comparison_chart(candidate_metrics, baseline_metrics), use_container_width=True)
+        st.plotly_chart(build_metric_comparison_chart(candidate_metrics, baseline_metrics), width='stretch')
     with detail_col:
         st.markdown('### Governance Verdict')
         st.write(f"Decision: `{governance['decision']}`")
         st.write(governance['rationale'])
         st.write(f"Production baseline: `C={PRODUCTION_BASELINE_PARAMS['C']:.0f}`, `solver={PRODUCTION_BASELINE_PARAMS['solver']}`, `penalty={PRODUCTION_BASELINE_PARAMS['penalty']}`")
+        st.write(f"Candidate threshold: `{candidate_result['params']['decision_threshold']:.2f}`")
         st.write(f"MLflow tracking URI: `{get_mlflow_tracking_uri()}`")
         st.write(f"MLflow experiment: `{get_mlflow_experiment_name()}`")
 
-    st.plotly_chart(build_precision_recall_figure(candidate_result, baseline_result), use_container_width=True)
+    st.plotly_chart(build_precision_recall_figure(candidate_result, baseline_result), width='stretch')
 
     action_col1, action_col2 = st.columns(2)
     with action_col1:
@@ -1353,7 +1816,7 @@ def render_technical_lab_tab():
         if st.button('Record Governance Decision'):
             connection = get_postgres_connection()
             try:
-                ensure_platform_tables(connection)
+                bootstrap_platform_tables_if_enabled(connection)
                 insert_governance_decision(
                     connection, candidate_name=build_lab_run_name(candidate_result['params']),
                     mlflow_run_id=st.session_state.get('latest_candidate_run_id'),
@@ -1410,36 +1873,81 @@ def render_deep_dive_analytics_tab():
             column for column in ['Churn', 'Contract', 'InternetService', 'PaymentMethod', 'Gouvernorat', 'tenure', 'MonthlyCharges']
             if column in analytics_df.columns
         ]
-        st.dataframe(analytics_df[preview_columns].head(20), use_container_width=True)
+        st.dataframe(analytics_df[preview_columns].head(20), width='stretch')
 
 
 def render_ground_truth_form(monitoring_df: pd.DataFrame):
     """Ground Truth Form - Confirm real outcomes"""
     unlabeled = monitoring_df[monitoring_df['actual_label'].isna()].copy()
-    if unlabeled.empty:
-        st.success('All recent predictions already have a confirmed outcome.')
-        return
+    labeled = monitoring_df[monitoring_df['actual_label'].notna()].copy()
+
+    status_cols = st.columns(3)
+    status_cols[0].metric('Pending Ground Truth', int(len(unlabeled)))
+    status_cols[1].metric('Confirmed Outcomes', int(len(labeled)))
+    status_cols[2].metric(
+        'Ground Truth Coverage',
+        f"{(len(labeled) / max(len(monitoring_df), 1)):.1%}",
+    )
 
     st.markdown('### Confirm Real Outcomes')
     st.caption('Use this block after some time has passed and you know what really happened to a customer.')
-    st.info('Example: if the model predicted "Churn" last month and you now know the customer stayed, select that prediction and set the confirmed outcome to "No churn".')
+    st.info(
+        'Select a saved prediction, choose what actually happened to that customer, and optionally document the retention action or business context.'
+    )
 
-    unlabeled['selection_label'] = unlabeled.apply(
+    selection_scope = st.radio(
+        'Prediction scope',
+        ['Pending outcomes only', 'All recent predictions'],
+        horizontal=True,
+        index=0 if not unlabeled.empty else 1,
+        help='Use "All recent predictions" if you want to review or correct a prediction that already has an outcome saved.',
+    )
+
+    selection_df = unlabeled.copy() if selection_scope == 'Pending outcomes only' else monitoring_df.copy()
+    if selection_df.empty:
+        st.success('All recent predictions already have a confirmed outcome.')
+        if not labeled.empty:
+            preview_columns = [
+                column
+                for column in ['id', 'created_at', 'predicted_label', 'actual_label', 'ground_truth_source', 'feedback_notes']
+                if column in labeled.columns
+            ]
+            with st.expander('Preview confirmed outcomes'):
+                st.dataframe(
+                    labeled[preview_columns].sort_values('created_at', ascending=False).head(10),
+                    width='stretch',
+                )
+        return
+
+    selection_df = selection_df.sort_values('created_at', ascending=False).copy()
+    selection_df['selection_label'] = selection_df.apply(
         lambda row: f"ID {row['id']} | {row['created_at']} | predicted={row['predicted_label']} | prob={row['predicted_probability']:.1%}",
         axis=1,
     )
-    selection_map = dict(zip(unlabeled['selection_label'], unlabeled['id']))
+    selection_map = dict(zip(selection_df['selection_label'], selection_df['id']))
 
     with st.form('ground_truth_form', clear_on_submit=False):
         selected_label = st.selectbox('Choose a past prediction', list(selection_map.keys()))
-        actual_label = st.selectbox('What really happened?', ['Churn', 'No churn'])
-        feedback_notes = st.text_area('Optional note', placeholder='Example: customer renewed contract after retention call')
+        selected_row = selection_df.loc[selection_df['selection_label'] == selected_label].iloc[0]
+        actual_options = ['Churn', 'No churn']
+        current_actual_label = selected_row['actual_label'] if pd.notna(selected_row.get('actual_label')) else 'Churn'
+        current_actual_label = current_actual_label if current_actual_label in actual_options else 'Churn'
+        actual_label = st.selectbox(
+            'What really happened?',
+            actual_options,
+            index=actual_options.index(current_actual_label),
+        )
+        feedback_notes = st.text_area(
+            'Optional note',
+            value='' if pd.isna(selected_row.get('feedback_notes')) else str(selected_row.get('feedback_notes')),
+            placeholder='Example: customer renewed contract after retention call',
+        )
         submitted = st.form_submit_button('Save Real Outcome')
 
     if submitted:
         connection = get_postgres_connection()
         try:
-            ensure_platform_tables(connection)
+            bootstrap_platform_tables_if_enabled(connection)
             update_prediction_ground_truth(
                 connection, prediction_id=selection_map[selected_label], actual_label=actual_label,
                 ground_truth_source='manual_review', feedback_notes=feedback_notes,
@@ -1455,17 +1963,22 @@ def render_ground_truth_form(monitoring_df: pd.DataFrame):
 def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.DataFrame, governance_df: pd.DataFrame, model, dv, scaler):
     """Monitoring Dashboard Tab - Production evidence and alerts"""
     st.subheader('📈 Monitoring Dashboard')
-    st.caption('PostgreSQL is the production evidence layer: it stores inference events, confirmed outcomes, alert history, and governance decisions.')
+    render_cicd_story_panel()
+    st.divider()
     render_automation_quick_guide()
     st.divider()
 
-    monitoring_df = build_decision_support_frame(predictions)
+    active_bundle_metadata = get_bundle_metadata()
+    active_baseline_metrics = get_baseline_metrics_from_metadata(active_bundle_metadata)
+    filtered_predictions = filter_predictions_for_active_model(predictions, active_bundle_metadata)
+    monitoring_df = build_decision_support_frame(filtered_predictions)
+    full_history_monitoring_df = build_decision_support_frame(predictions)
     if monitoring_df.empty:
         st.info('No prediction logs are available yet. Run a few production inferences first.')
         return
 
     live_metrics = calculate_live_metrics(monitoring_df)
-    computed_alerts = detect_monitoring_alerts(monitoring_df, PRODUCTION_BASELINE_METRICS)
+    computed_alerts = detect_monitoring_alerts(monitoring_df, active_baseline_metrics)
     latest_governance = governance_df.iloc[0].to_dict() if not governance_df.empty else None
     lifecycle_df = build_lifecycle_frame(
         alerts=computed_alerts,
@@ -1478,6 +1991,10 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
     revenue_at_risk = high_risk_count * avg_monthly_bill
     model_trust_score = calculate_model_trust_score(computed_alerts)
     recommended_action = get_manager_recommended_action(computed_alerts, high_risk_count)
+    active_variant_name = active_bundle_metadata.get('variant_name', 'Unknown')
+    active_run_id = active_bundle_metadata.get('mlflow_run_id') or active_bundle_metadata.get('run_id') or 'Unknown'
+    active_model_version = active_bundle_metadata.get('mlflow_model_version', 'Unknown')
+    filtered_from_full_history = len(filtered_predictions) != len(predictions)
 
     # Summary Status
     summary_status = "Healthy"
@@ -1489,6 +2006,17 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
         summary_status = "Warning: Monitor Closely"
         summary_color = "#fff3cd"
     st.markdown(f'<div style="border-radius:14px;padding:0.8rem 1rem;margin-bottom:0.7rem;background:{summary_color};font-weight:600;">Monitoring Summary: {summary_status}</div>', unsafe_allow_html=True)
+    if filtered_from_full_history:
+        st.info(
+            f'Monitoring health is currently computed from predictions produced by the active deployed model '
+            f'`{active_variant_name}` (MLflow version `{active_model_version}`, run `{active_run_id}`).'
+        )
+        st.caption('Historical charts below still use the full prediction history for business visibility.')
+    else:
+        st.caption(
+            'Monitoring is using all available prediction logs because no narrower active-model match '
+            'was found in stored prediction history yet.'
+        )
 
     # Manager Command Center
     st.markdown('### Manager Command Center')
@@ -1504,7 +2032,7 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
         if st.button('Seed Balanced Demo Predictions'):
             connection = get_postgres_connection()
             try:
-                ensure_platform_tables(connection)
+                bootstrap_platform_tables_if_enabled(connection)
                 inserted_count = seed_demo_predictions(connection, model, dv, scaler)
                 st.success(f'Inserted {inserted_count} demo prediction records.')
                 st.rerun()
@@ -1516,7 +2044,7 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
         if st.button('Seed Demo Ground Truth Outcomes'):
             connection = get_postgres_connection()
             try:
-                ensure_platform_tables(connection)
+                bootstrap_platform_tables_if_enabled(connection)
                 updated_count = seed_demo_ground_truth(connection, monitoring_df)
                 if updated_count == 0:
                     st.info('No unlabeled prediction records are available for demo outcomes.')
@@ -1532,7 +2060,7 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
     kpi_cols = st.columns(4)
     kpi_cols[0].metric('Total Inferences', f'{len(monitoring_df)}')
     kpi_cols[1].metric('Avg Churn Probability', f"{monitoring_df['predicted_probability'].mean():.1%}")
-    kpi_cols[2].metric('Open Alerts', f"{int((alerts_df['status'] == 'open').sum()) if not alerts_df.empty else len(computed_alerts)}")
+    kpi_cols[2].metric('Open Alerts', f"{len(computed_alerts)}")
     kpi_cols[3].metric('Ground-Truth Coverage', f"{live_metrics.get('coverage', 0.0):.1%}")
 
     decision_cols = st.columns(4)
@@ -1550,7 +2078,7 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
         st.markdown('### Lifecycle View')
         st.plotly_chart(
             build_lifecycle_figure(lifecycle_df),
-            use_container_width=True,
+            width='stretch',
             key='monitoring_lifecycle_view',
         )
     with right_col:
@@ -1562,37 +2090,167 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
         else:
             st.success(retraining['status'])
         st.write(retraining['reason'])
+        retrain_profile = st.selectbox(
+            'Training profile',
+            ['quick', 'balanced', 'full'],
+            index=0,
+            help='Quick is fastest for operational retraining. Full is the most exhaustive search.',
+            key='monitoring_retrain_profile',
+        )
+        default_execution_mode = get_automation_execution_mode()
+        execution_mode_options = ['auto', 'github', 'local']
+        if default_execution_mode == 'github':
+            execution_mode_options = ['github']
+        elif default_execution_mode == 'local':
+            execution_mode_options = ['local', 'auto', 'github']
+        retrain_execution_mode = st.selectbox(
+            'Retraining execution mode',
+            execution_mode_options,
+            index=0,
+            help='Use GitHub to keep retraining off the local machine. Auto follows the configured default and falls back only when allowed.',
+            key='monitoring_retrain_execution_mode',
+        )
+        if retrain_execution_mode == 'github' and not is_github_training_dispatch_ready():
+            st.warning(
+                'GitHub Actions retraining is not configured yet. '
+                'Set the GitHub dispatch environment variables to enable CI/CD-triggered retraining.'
+            )
+        monitoring_execution_mode_options = ['github'] if default_execution_mode == 'github' else ['github', 'auto']
+        monitoring_execution_mode = st.selectbox(
+            'Monitoring execution mode',
+            monitoring_execution_mode_options,
+            index=0,
+            help='GitHub mode runs monitoring on GitHub-hosted runners instead of inside the Streamlit container.',
+            key='monitoring_execution_mode',
+        )
+        if not is_github_monitoring_dispatch_ready():
+            st.warning(
+                'GitHub Actions monitoring is not configured yet. '
+                'Set GITHUB_ACTIONS_TOKEN, GITHUB_REPOSITORY, GITHUB_MONITORING_WORKFLOW, and GITHUB_WORKFLOW_REF.'
+            )
+        auto_retrain_enabled = st.checkbox(
+            'Auto-retrain when monitoring threshold is reached',
+            value=True,
+            help='In GitHub mode, the remote monitoring workflow will launch remote retraining when the threshold is reached.',
+            key='monitoring_auto_retrain_enabled',
+        )
+        auto_retrain_threshold = st.number_input(
+            'Auto-retrain threshold',
+            min_value=1,
+            max_value=10,
+            value=2,
+            step=1,
+            help='Number of high-severity alerts required before retraining starts automatically.',
+            key='monitoring_auto_retrain_threshold',
+        )
+        st.caption(
+            f'Current high-severity alerts: {count_high_severity_alerts(computed_alerts)} '
+            f'of {int(auto_retrain_threshold)} required.'
+        )
 
-    if st.button('Run Monitoring Cycle', type='primary'):
-        connection = get_postgres_connection()
-        try:
-            ensure_platform_tables(connection)
-            replace_monitoring_alerts(connection, computed_alerts)
-            st.success('Monitoring alerts refreshed and stored in PostgreSQL.')
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button('Run Monitoring Cycle', type='primary'):
+        if monitoring_execution_mode in {'github', 'auto'}:
+            with st.spinner('Dispatching remote monitoring workflow on GitHub Actions...'):
+                success, output = launch_monitoring_pipeline(
+                    days=14,
+                    threshold=int(auto_retrain_threshold),
+                    auto_retrain=auto_retrain_enabled,
+                    profile=retrain_profile,
+                    execution_mode='github' if monitoring_execution_mode == 'github' else get_automation_execution_mode(),
+                )
+            if success:
+                st.success(
+                    'Remote monitoring workflow launched successfully on GitHub Actions. '
+                    'It will evaluate production evidence and optionally launch remote retraining based on the threshold.'
+                )
+                if output:
+                    st.info(output)
+            else:
+                st.error('Remote monitoring workflow could not be launched.')
+                if output:
+                    st.code(output)
+        else:
+            connection = get_postgres_connection()
+            monitoring_stored = False
+            try:
+                bootstrap_platform_tables_if_enabled(connection)
+                replace_monitoring_alerts(connection, computed_alerts)
+                monitoring_stored = True
+            except Exception as error:
+                st.error(f'Unable to store monitoring alerts: {error}')
+            finally:
+                connection.close()
+            if monitoring_stored:
+                high_alert_count = count_high_severity_alerts(computed_alerts)
+                should_auto_retrain = auto_retrain_enabled and high_alert_count >= int(auto_retrain_threshold)
+                if should_auto_retrain:
+                    with st.spinner(f'Monitoring threshold reached. Launching {retrain_profile} retraining pipeline...'):
+                        success, output = launch_training_pipeline(
+                            reason='streamlit_monitoring_auto_retrain',
+                            profile=retrain_profile,
+                            execution_mode=retrain_execution_mode,
+                        )
+                    if success:
+                        st.cache_data.clear()
+                        st.success(
+                            f'Monitoring alerts were stored and retraining was launched successfully via '
+                            f'`{retrain_execution_mode}` mode. The app is reloading its state now.'
+                        )
+                        if output:
+                            st.info(output)
+                        st.rerun()
+                    st.error('Monitoring alerts were stored, but automatic retraining failed.')
+                    if output:
+                        st.code(output)
+                else:
+                    st.success('Monitoring alerts refreshed and stored in PostgreSQL.')
+                    if auto_retrain_enabled:
+                        st.info(
+                            f'Automatic retraining did not start because only {high_alert_count} high-severity '
+                            f'alert(s) are active and the threshold is {int(auto_retrain_threshold)}.'
+                        )
+                    st.rerun()
+    retrain_label = 'Retrain Model Now' if retraining['status'] == 'Retraining Recommended' else 'Run Retraining Now'
+    if action_col2.button(retrain_label):
+        with st.spinner(f'Launching {retrain_profile} training pipeline...'):
+            success, output = launch_training_pipeline(
+                reason='streamlit_manual_retrain',
+                profile=retrain_profile,
+                execution_mode=retrain_execution_mode,
+            )
+        if success:
+            st.cache_data.clear()
+            st.success(
+                f'Training pipeline launched successfully with the "{retrain_profile}" profile '
+                f'via `{retrain_execution_mode}` mode.'
+            )
+            if output:
+                st.info(output)
             st.rerun()
-        except Exception as error:
-            st.error(f'Unable to store monitoring alerts: {error}')
-        finally:
-            connection.close()
+        else:
+            st.error('Training pipeline failed.')
+            if output:
+                st.code(output)
 
     st.divider()
     chart_col1, chart_col2 = st.columns(2)
     with chart_col1:
         st.markdown('### Risk Distribution')
         st.plotly_chart(
-            build_risk_distribution_chart(monitoring_df),
-            use_container_width=True,
+            build_risk_distribution_chart(full_history_monitoring_df),
+            width='stretch',
             key='monitoring_operational_risk_distribution',
         )
     with chart_col2:
         st.markdown('### Probability Drift')
-        drift_df = build_probability_drift_frame(monitoring_df)
+        drift_df = build_probability_drift_frame(full_history_monitoring_df)
         if drift_df.empty:
             st.info('Not enough monitoring data to compute drift yet.')
         else:
             st.plotly_chart(
                 build_probability_drift_chart(drift_df),
-                use_container_width=True,
+                width='stretch',
                 key='monitoring_probability_drift',
             )
 
@@ -1608,7 +2266,7 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
             metric_cols = st.columns(4)
             metric_cols[0].metric('Labeled Records', f"{live_metrics['sample_size']}")
             metric_cols[1].metric('Live Accuracy', f"{live_metrics['accuracy']:.3f}")
-            metric_cols[2].metric('Live F1', f"{live_metrics['f1']:.3f}", delta=f"{live_metrics['f1'] - PRODUCTION_BASELINE_METRICS['f1']:+.3f}")
+            metric_cols[2].metric('Live F1', f"{live_metrics['f1']:.3f}", delta=f"{live_metrics['f1'] - active_baseline_metrics['f1']:+.3f}")
             roc_auc = live_metrics.get('roc_auc')
             metric_cols[3].metric('Live ROC-AUC', f"{roc_auc:.3f}" if pd.notna(roc_auc) else 'N/A')
     with gov_col:
@@ -1627,24 +2285,29 @@ def render_monitoring_dashboard_tab(predictions: pd.DataFrame, alerts_df: pd.Dat
     alerts_col, records_col = st.columns([0.95, 1.05])
     with alerts_col:
         st.markdown('### Active Alerts')
-        if alerts_df.empty:
-            if not computed_alerts:
-                st.success('No active alerts at the moment.')
-            else:
-                for alert in computed_alerts:
-                    st.write(f"- `{alert['severity']}`: {format_monitoring_alert(alert)}")
+        if not computed_alerts:
+            st.success('No active alerts at the moment for the currently deployed model.')
         else:
-            open_alerts = alerts_df[alerts_df['status'] == 'open']
-            if open_alerts.empty:
-                st.success('No open alerts are currently stored.')
-            else:
-                for _, alert_row in open_alerts.iterrows():
-                    st.write(f"- `{alert_row['severity']}`: {format_monitoring_alert(alert_row.to_dict())}")
+            for alert in computed_alerts:
+                st.write(f"- `{alert['severity']}`: {format_monitoring_alert(alert)}")
+        st.markdown('### Stored Alert History')
+        if alerts_df.empty:
+            st.info('No monitoring alerts have been stored in PostgreSQL yet.')
+        else:
+            alert_history_columns = [
+                column for column in ['created_at', 'alert_type', 'severity', 'status', 'message']
+                if column in alerts_df.columns
+            ]
+            st.dataframe(
+                alerts_df[alert_history_columns].sort_values('created_at', ascending=False).head(10),
+                width='stretch',
+                hide_index=True,
+            )
     with records_col:
         st.markdown('### Recent Production Records')
         display_columns = ['id', 'created_at', 'predicted_probability', 'predicted_label', 'predicted_risk', 'actual_label', 'model_version', 'Contract', 'InternetService']
         available_columns = [column for column in display_columns if column in monitoring_df.columns]
-        st.dataframe(monitoring_df[available_columns].sort_values('created_at', ascending=False), use_container_width=True)
+        st.dataframe(monitoring_df[available_columns].sort_values('created_at', ascending=False), width='stretch')
 
 
 # ============================================================
@@ -1683,7 +2346,7 @@ def main():
         render_mlops_sidebar_status()
 
     # Page configuration
-    st.set_page_config(page_title='TeleLink Churn Prediction', page_icon=PAGE_ICON, layout='wide')
+    st.set_page_config(page_title='TelCo Churn Prediction', page_icon=PAGE_ICON, layout='wide')
     inject_custom_style()
 
     # Load data
@@ -1696,7 +2359,7 @@ def main():
 
     # New tab structure: Managerial Decision Support System
     tabs = st.tabs([
-        '📋 Single Prediction',
+        '📋 Predictions',
         '📊 Manager Insights',
         '📞 Action Center',
         '🧪 Technical Lab',

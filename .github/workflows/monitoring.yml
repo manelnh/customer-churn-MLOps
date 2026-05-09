@@ -4,11 +4,45 @@ on:
   schedule:
     - cron: '0 6 * * *'
   workflow_dispatch:
+    inputs:
+      days:
+        description: Lookback window in days
+        required: false
+        default: '14'
+      threshold:
+        description: High-severity alert threshold for retraining trigger
+        required: false
+        default: '2'
+      auto_retrain:
+        description: Automatically launch remote retraining when the threshold is reached
+        required: false
+        default: 'true'
+      profile:
+        description: Training profile used if remote retraining is triggered
+        required: false
+        default: quick
+
+concurrency:
+  group: remote-monitoring
+  cancel-in-progress: false
 
 jobs:
   monitor-production-model:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+      POSTGRES_PORT: ${{ secrets.POSTGRES_PORT || '5432' }}
+      POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+      MLFLOW_EXPERIMENT_NAME: ${{ secrets.MLFLOW_EXPERIMENT_NAME || 'churn_prediction' }}
+      MONITORING_DAYS: ${{ github.event.inputs.days || vars.MONITORING_DAYS || '14' }}
+      RETRAIN_THRESHOLD: ${{ github.event.inputs.threshold || vars.RETRAIN_THRESHOLD || '2' }}
+      AUTO_RETRAIN_ENABLED: ${{ github.event.inputs.auto_retrain || vars.AUTO_RETRAIN_ENABLED || 'true' }}
+      TRAINING_PROFILE: ${{ github.event.inputs.profile || vars.TRAINING_PROFILE || 'quick' }}
 
     steps:
       - name: Check out repository
@@ -27,31 +61,74 @@ jobs:
           pip install -r requirements.txt
 
       - name: Validate required secrets
-        env:
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
-          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
-          if [ -z "$POSTGRES_HOST" ] || [ -z "$POSTGRES_DB" ] || [ -z "$POSTGRES_USER" ] || [ -z "$POSTGRES_PASSWORD" ]; then
-            echo "One or more required Postgres secrets are not configured."
+          HAS_DATABASE_URL="false"
+          if [ -n "$DATABASE_URL" ]; then
+            HAS_DATABASE_URL="true"
+          fi
+          HAS_POSTGRES_PARTS="false"
+          if [ -n "$POSTGRES_HOST" ] && [ -n "$POSTGRES_DB" ] && [ -n "$POSTGRES_USER" ] && [ -n "$POSTGRES_PASSWORD" ]; then
+            HAS_POSTGRES_PARTS="true"
+          fi
+          if [ "$HAS_DATABASE_URL" != "true" ] && [ "$HAS_POSTGRES_PARTS" != "true" ]; then
+            echo "Required secrets are missing."
+            echo "Provide either DATABASE_URL or the POSTGRES_* secrets for an externally reachable PostgreSQL service."
+            exit 1
+          fi
+          if [ -z "$MLFLOW_TRACKING_URI" ]; then
+            echo "MLFLOW_TRACKING_URI is missing."
             exit 1
           fi
 
+      - name: Build DATABASE_URL from POSTGRES_* when needed
+        if: env.DATABASE_URL == ''
+        run: |
+          echo "DATABASE_URL=postgresql+psycopg2://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB" >> "$GITHUB_ENV"
+
+      - name: Check MLflow reachability
+        run: |
+          python -c "import os, urllib.request; urllib.request.urlopen(os.environ['MLFLOW_TRACKING_URI'], timeout=20); print('MLflow reachable')"
+
+      - name: Check PostgreSQL reachability
+        run: |
+          python -c "import os, psycopg2; conn=psycopg2.connect(os.environ['DATABASE_URL'].replace('postgresql+psycopg2://','postgresql://',1)); conn.close(); print('PostgreSQL reachable')"
+
       - name: Apply database migrations
-        env:
-          DATABASE_URL: postgresql+psycopg2://${{ secrets.POSTGRES_USER }}:${{ secrets.POSTGRES_PASSWORD }}@${{ secrets.POSTGRES_HOST }}:${{ secrets.POSTGRES_PORT || '5432' }}/${{ secrets.POSTGRES_DB }}
         run: |
           alembic upgrade head
 
       - name: Run monitoring cycle
-        env:
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_PORT: ${{ secrets.POSTGRES_PORT || '5432' }}
-          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
-          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
-          MLFLOW_EXPERIMENT_NAME: ${{ secrets.MLFLOW_EXPERIMENT_NAME || 'churn_prediction' }}
+        id: monitoring
         run: |
-          python Scripts/run_monitoring.py --days 14 --threshold 2 --fail-on-high-alerts
+          set +e
+          CMD=(python Scripts/run_monitoring.py --days "$MONITORING_DAYS" --threshold "$RETRAIN_THRESHOLD" --fail-on-high-alerts)
+          "${CMD[@]}"
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "auto_retrain_enabled=$AUTO_RETRAIN_ENABLED" >> "$GITHUB_OUTPUT"
+          if [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 2 ]; then
+            exit "$EXIT_CODE"
+          fi
+
+      - name: Launch scheduled remote retraining
+        if: steps.monitoring.outputs.exit_code == '2' && steps.monitoring.outputs.auto_retrain_enabled == 'true'
+        run: |
+          python Scripts/run_training.py --reason "monitoring_alert_auto_retrain" --profile "$TRAINING_PROFILE"
+
+      - name: Write workflow summary
+        if: always()
+        run: |
+          {
+            echo "## Remote Monitoring Summary"
+            echo ""
+            echo "- Monitoring days: \`$MONITORING_DAYS\`"
+            echo "- Retrain threshold: \`$RETRAIN_THRESHOLD\`"
+            echo "- Auto retrain: \`$AUTO_RETRAIN_ENABLED\`"
+            echo "- Training profile if triggered: \`$TRAINING_PROFILE\`"
+            echo "- MLflow URI: \`$MLFLOW_TRACKING_URI\`"
+            if [ -n "$POSTGRES_HOST" ]; then
+              echo "- PostgreSQL host: \`$POSTGRES_HOST\`"
+            else
+              echo "- PostgreSQL host: supplied through \`DATABASE_URL\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

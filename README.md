@@ -96,6 +96,12 @@ The initial migration creates:
 - `monitoring_alerts`
 - `governance_decisions`
 
+Schema responsibility is intentionally separated from the app:
+
+- migrations define the database structure
+- CI/CD and deployment startup run those migrations explicitly
+- the application then uses the schema instead of silently changing it on every request
+
 ## CI
 
 GitHub Actions CI is defined in `.github/workflows/ci.yml` and now performs:
@@ -106,6 +112,27 @@ GitHub Actions CI is defined in `.github/workflows/ci.yml` and now performs:
 - unit tests with coverage
 - Docker image build validation
 
+## CI/CD Story For The Jury
+
+This repository uses GitHub Actions as the control plane for quality, delivery, and operational MLOps tasks.
+
+How the integration works:
+
+- `CI` runs on every push and pull request to catch Python errors, broken imports, failing tests, and Docker build regressions before code is merged.
+- `Training` can run on a weekly schedule or be launched on demand with `workflow_dispatch`, so retraining happens on clean GitHub runners instead of a developer machine.
+- `Monitoring` can run every day on a schedule or be launched on demand from GitHub to evaluate live production evidence and raise retraining signals in a traceable way.
+- `CD` builds and publishes the container image so the deployed app matches a reviewed Git commit and an auditable automation trail.
+
+Why this matters in front of a jury:
+
+- it shows that the project is not only a model notebook or dashboard, but a managed ML system with controls around quality, reproducibility, and release
+- it separates development, validation, deployment, and operations into explicit stages that can be demonstrated independently
+- it reduces manual risk because tests, packaging, and operational jobs run the same way every time
+- it improves auditability because retraining and monitoring actions are logged through the same automation layer as code changes
+- it makes the project easier to scale to a team setting because the process does not depend on hidden local steps
+
+In short, the CI/CD layer is the bridge between the model and real production practice: it turns a good churn model into an end-to-end MLOps workflow.
+
 ## CD And Automation
 
 Additional GitHub Actions workflows are included:
@@ -113,9 +140,9 @@ Additional GitHub Actions workflows are included:
 - `.github/workflows/cd.yml`
   Builds and pushes a Docker image to GitHub Container Registry on `main`/`master` and tags. If `DEPLOY_WEBHOOK_URL` is configured as a GitHub secret, it also triggers deployment automatically.
 - `.github/workflows/monitoring.yml`
-  Runs a scheduled monitoring cycle every day and can also be launched manually.
+  Runs the monitoring cycle daily on GitHub Actions and also supports manual dispatch against externally reachable PostgreSQL and MLflow services. When high-severity alerts are detected, it can launch remote retraining on GitHub runners automatically.
 - `.github/workflows/training.yml`
-  Runs scheduled retraining every Monday and supports manual dispatch.
+  Runs retraining weekly on GitHub Actions and also supports manual dispatch against an externally reachable MLflow service.
 
 ## Required GitHub Secrets
 
@@ -123,12 +150,66 @@ To activate the full MLOps automation on GitHub, configure these repository or e
 
 - `MLFLOW_TRACKING_URI`
 - `MLFLOW_EXPERIMENT_NAME`
+- `DATABASE_URL` or the separate PostgreSQL secrets below
 - `POSTGRES_HOST`
 - `POSTGRES_PORT`
 - `POSTGRES_DB`
 - `POSTGRES_USER`
 - `POSTGRES_PASSWORD`
 - `DEPLOY_WEBHOOK_URL` for optional deployment triggering
+
+Using `DATABASE_URL` is the simplest option for remote monitoring workflows because it avoids splitting the PostgreSQL connection across multiple secrets.
+
+## Streamlit-To-CI/CD Retraining
+
+The Monitoring Dashboard can also dispatch the GitHub `Training` workflow directly instead of retraining only inside the local app container.
+
+To enable that path, provide these runtime environment variables to the Streamlit app:
+
+- `GITHUB_ACTIONS_TOKEN`
+- `GITHUB_REPOSITORY`
+- `GITHUB_TRAINING_WORKFLOW` such as `training.yml`
+- `GITHUB_MONITORING_WORKFLOW` such as `monitoring.yml`
+- `GITHUB_WORKFLOW_REF` such as `main`
+
+The workflow ref must point to a branch or tag where those workflow files are already pushed with the expected `workflow_dispatch` inputs. If GitHub responds with `HTTP 422` and `Unexpected inputs provided`, the target ref is usually still serving an older workflow definition.
+
+If you want the Streamlit app to avoid local execution and prefer GitHub-hosted automation, also set:
+
+- `AUTOMATION_EXECUTION_MODE=github`
+
+When those values are configured, the app can trigger `workflow_dispatch` on the GitHub training pipeline and pass both the retraining reason and the selected training profile.
+
+This is useful when you want retraining to happen through the same CI/CD control plane that handles auditability, centralized logs, runner isolation, and release automation.
+
+## Important Note About GitHub-Run Training And Monitoring
+
+The `Training` and `Monitoring` workflows are designed to run on GitHub-hosted runners.
+
+- They require your MLflow and PostgreSQL services to be reachable from GitHub Actions.
+- Local Docker addresses such as `http://localhost:5000` or `db` will not work from GitHub-hosted runners.
+- If your services are local-only, GitHub automation cannot reach them until you move them to an externally reachable environment.
+
+## Full Remote Automation Checklist
+
+To make retraining and monitoring fully remote instead of local:
+
+1. Host PostgreSQL on a service reachable from GitHub Actions.
+2. Host MLflow on a service reachable from GitHub Actions.
+3. Set GitHub repository secrets for:
+   - `MLFLOW_TRACKING_URI`
+   - `MLFLOW_EXPERIMENT_NAME`
+   - `DATABASE_URL` or `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD`
+4. Keep the Streamlit app configured with:
+   - `GITHUB_ACTIONS_TOKEN`
+   - `GITHUB_REPOSITORY`
+   - `GITHUB_TRAINING_WORKFLOW`
+   - `GITHUB_MONITORING_WORKFLOW`
+   - `GITHUB_WORKFLOW_REF`
+   - `AUTOMATION_EXECUTION_MODE=github`
+5. Trigger one manual GitHub training run and one manual GitHub monitoring run to validate connectivity before relying on the schedules.
+
+The updated workflows now fail early with explicit reachability checks for MLflow and PostgreSQL, which makes remote setup debugging much faster.
 
 ## Project MLOps Coverage
 
