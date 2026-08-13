@@ -112,7 +112,7 @@ GitHub Actions CI is defined in `.github/workflows/ci.yml` and now performs:
 - unit tests with coverage
 - Docker image build validation
 
-## CI/CD Story For The Jury
+## CI/CD 
 
 This repository uses GitHub Actions as the control plane for quality, delivery, and operational MLOps tasks.
 
@@ -123,7 +123,7 @@ How the integration works:
 - `Monitoring` can run every day on a schedule or be launched on demand from GitHub to evaluate live production evidence and raise retraining signals in a traceable way.
 - `CD` builds and publishes the container image so the deployed app matches a reviewed Git commit and an auditable automation trail.
 
-Why this matters in front of a jury:
+Why this matters:
 
 - it shows that the project is not only a model notebook or dashboard, but a managed ML system with controls around quality, reproducibility, and release
 - it separates development, validation, deployment, and operations into explicit stages that can be demonstrated independently
@@ -173,10 +173,6 @@ To enable that path, provide these runtime environment variables to the Streamli
 - `GITHUB_WORKFLOW_REF` such as `main`
 
 The workflow ref must point to a branch or tag where those workflow files are already pushed with the expected `workflow_dispatch` inputs. If GitHub responds with `HTTP 422` and `Unexpected inputs provided`, the target ref is usually still serving an older workflow definition.
-
-If you want the Streamlit app to avoid local execution and prefer GitHub-hosted automation, also set:
-
-- `AUTOMATION_EXECUTION_MODE=github`
 
 When those values are configured, the app can trigger `workflow_dispatch` on the GitHub training pipeline and pass both the retraining reason and the selected training profile.
 
