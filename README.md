@@ -135,7 +135,7 @@ python Scripts/run_training.py --reason manual_validation
 It loads the churn dataset, trains multiple logistic regression variants, logs experiments to MLflow, saves the best production bundle locally, and attempts MLflow model registration/promotion.
 
 <p align="center">
-  <img src="app_33.png" alt="MLflow run detail showing accuracy, F1, ROC AUC for the production model" width="800">
+  <img src="assets/app_33.png" alt="MLflow run detail showing accuracy, F1, ROC AUC for the production model" width="800">
   <br>
   <sub>A production training run logged to MLflow, with metrics tracked for every candidate model</sub>
 </p>
@@ -179,7 +179,7 @@ GitHub Actions acts as the control plane for quality, delivery, and operational 
 This turns a good churn model into an auditable, end-to-end MLOps workflow — tests, packaging, and operational jobs run identically every time, which also makes the project easier to scale to a team setting.
 
 <p align="center">
-  <img src="app_37.png" alt="MLflow monitoring run showing live drift alerts (accuracy drop, high-risk increase)" width="800">
+  <img src="assets/app_37.png" alt="MLflow monitoring run showing live drift alerts (accuracy drop, high-risk increase)" width="800">
   <br>
   <sub>A scheduled monitoring run detecting real drift — accuracy drop and high-risk-rate increase alerts, logged automatically</sub>
 </p>
