@@ -4,6 +4,8 @@
 
 **A production-style customer churn system — prediction, governance, monitoring, and automated retraining, end to end.**
 
+*Built to demonstrate a complete MLOps lifecycle: not just "a model that predicts churn," but the surrounding infrastructure that keeps that model trustworthy over time — logging, monitoring, scheduled retraining, and a reviewable audit trail for every decision.*
+
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-app-ff4b4b?logo=streamlit&logoColor=white)
 ![MLflow](https://img.shields.io/badge/MLflow-tracking-0194E2?logo=mlflow&logoColor=white)
@@ -41,19 +43,23 @@
 
 ## 🚀 What This Is
 
-This project packages a churn prediction workflow into a full **MLOps system**, not just a notebook or a dashboard:
+Most churn-prediction projects stop at a notebook: train a model, print an accuracy score, done. This repo goes further — it treats churn prediction as a **live system that has to keep working after deployment**, not just a one-off analysis. That means predictions need to be logged somewhere durable, model performance needs to be watched for drift over time, retraining needs to happen on a schedule instead of "whenever someone remembers," and every step needs to be reproducible by a teammate (or a grader) without depending on hidden local setup.
 
-| Component | Role |
-|---|---|
-| 🎛️ **Streamlit app** | Production-style inference UI and operational review |
-| 🐘 **PostgreSQL** | Prediction logs, governance records, monitoring alerts |
-| 📊 **MLflow** | Experiment tracking and monitoring run history |
-| ⚙️ **GitHub Actions** | CI, container delivery, scheduled monitoring & retraining |
-| 🧱 **Alembic** | Reproducible database schema migrations |
+Concretely, the project packages a churn prediction workflow into a full **MLOps system** built from five pieces that each solve one part of that problem:
+
+| Component | Role | Why it's there |
+|---|---|---|
+| 🎛️ **Streamlit app** | Production-style inference UI and operational review | Gives non-technical users (managers, ops teams) a way to act on predictions without touching code |
+| 🐘 **PostgreSQL** | Prediction logs, governance records, monitoring alerts | Predictions and decisions need a durable, queryable home — not just in-memory state that disappears on refresh |
+| 📊 **MLflow** | Experiment tracking and monitoring run history | Every training run and monitoring check is logged, so model quality over time is auditable, not just "trust me" |
+| ⚙️ **GitHub Actions** | CI, container delivery, scheduled monitoring & retraining | Automation runs the same way every time, on infrastructure nobody has to babysit, with a visible history of every run |
+| 🧱 **Alembic** | Reproducible database schema migrations | The database schema evolves through versioned migrations instead of manual, undocumented changes |
 
 ---
 
 ## 🏗️ Architecture
+
+The diagram below shows how the pieces connect. The Streamlit app is the only component end users touch directly — everything else runs in the background. Predictions and training runs get logged to PostgreSQL and MLflow respectively, so nothing lives only in memory. The monitoring and training scripts can run either locally (triggered manually or via `docker compose`) or remotely as scheduled GitHub Actions jobs — the same scripts, just run on different infrastructure depending on whether you're developing locally or operating in production.
 
 ```mermaid
 flowchart LR
@@ -69,11 +75,13 @@ flowchart LR
     A -.dispatch.-> K
 ```
 
+The dotted line matters most for day-to-day use: it means a manager can trigger retraining directly from the Streamlit Monitoring Dashboard, and that request flows through the same GitHub Actions pipeline that handles scheduled retraining — so there's one auditable path for "why did the model change," not two separate ones.
+
 ---
 
 ## ⚡ Quick Start
 
-The fastest way to run everything locally is Docker Compose:
+Everything this project needs — the Streamlit app, PostgreSQL, and MLflow — is defined as services in `docker-compose.yml`, so there's no manual "install Postgres, install MLflow separately" setup required. The fastest way to get a fully working environment running locally is Docker Compose:
 
 ```bash
 docker compose up --build
@@ -96,11 +104,13 @@ Then open:
 
 ## 🧭 Core User Flow
 
-1. **Single Prediction** — run predictions for individual customers
-2. **Manager Insights** — review risk summaries
-3. **Action Center** — save operational decisions
-4. **Technical Lab** — compare a candidate model and log it to MLflow
-5. **Monitoring Dashboard** — review live evidence and stored alerts
+The app is organized as five tabs, meant to be used roughly in this order — from an individual prediction all the way to deciding whether the model itself needs to be retrained:
+
+1. **Single Prediction** — Enter a customer's details and get a churn risk score. This is the entry point: one customer at a time, useful for spot-checks or handling an individual case.
+2. **Manager Insights** — Zoom out from individual predictions to the aggregate picture: revenue at risk, how many customers fall into each risk tier, and how the operational queue of pending actions is shaping up. This is the view built for a manager who needs a status check, not a technical deep-dive.
+3. **Action Center** — Once risk is identified, someone has to decide what to do about it. This tab is where retention actions get recorded against specific customers, creating a governance trail — who decided what, and when.
+4. **Technical Lab** — For more hands-on comparison: train or evaluate a candidate model and log the run to MLflow, so it can be compared against what's currently in production before anyone promotes it.
+5. **Monitoring Dashboard** — The feedback loop. Review live evidence of how the deployed model is actually performing against real production data, see any drift alerts that have fired, and — if things look concerning enough — trigger retraining directly from here.
 
 ---
 
@@ -148,11 +158,11 @@ alembic upgrade head
 ```
 
 The initial migration creates:
-- `prediction_logs`
-- `monitoring_alerts`
-- `governance_decisions`
+- `prediction_logs` — every prediction the app has made, so nothing is lost once the session ends
+- `monitoring_alerts` — records of drift/performance alerts raised by the monitoring script
+- `governance_decisions` — the audit trail of retention actions taken from the Action Center
 
-Schema responsibility is intentionally separated from the app — migrations define structure, CI/CD and deployment run them explicitly, and the app uses the schema rather than silently altering it.
+Schema responsibility is intentionally separated from the app — migrations define structure, CI/CD and deployment run them explicitly, and the app uses the schema rather than silently altering it. This separation matters in practice: if the app itself could create or alter tables on the fly, two developers running slightly different app versions against the same database could end up with silently diverging schemas. Migrations make schema changes explicit, versioned, and reviewable, the same way code changes are.
 
 ---
 
