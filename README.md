@@ -20,9 +20,8 @@
 ## 🖼️ Preview
 
 <p align="center">
-  <img src="app_1.png" alt="Manager Insights dashboard — executive snapshot, risk breakdown, and operational queue" width="850">
+  <img src="assets/app_1.png" alt="Manager Insights dashboard — executive snapshot, risk breakdown, and operational queue" width="850">
 </p>
-
 ---
 
 ## 📚 Table of Contents
