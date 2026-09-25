@@ -1,221 +1,249 @@
-# Churn Prediction MLOps App
+<div align="center">
 
-This project packages a churn prediction workflow with:
+# 📉 Churn Prediction MLOps App
 
-- a Streamlit application for production-style inference and review
-- PostgreSQL for prediction logs, governance records, and monitoring alerts
-- MLflow for experiment tracking and monitoring run history
-- GitHub Actions pipelines for CI, container delivery, scheduled monitoring, and scheduled retraining
-- Alembic migrations for reproducible database schema management
+**A production-style customer churn system — prediction, governance, monitoring, and automated retraining, end to end.**
 
-## Local Startup
+![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-app-ff4b4b?logo=streamlit&logoColor=white)
+![MLflow](https://img.shields.io/badge/MLflow-tracking-0194E2?logo=mlflow&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-database-4169E1?logo=postgresql&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-The easiest first-time setup is Docker Compose:
+</div>
 
-```powershell
+---
+
+## 🖼️ Preview
+
+<p align="center">
+  <img src="app_1.png" alt="Manager Insights dashboard — executive snapshot, risk breakdown, and operational queue" width="850">
+</p>
+
+---
+
+## 📚 Table of Contents
+
+- [What This Is](#-what-this-is)
+- [Architecture](#-architecture)
+- [Quick Start](#-quick-start)
+- [Core User Flow](#-core-user-flow)
+- [Terminal Usage](#-terminal-usage)
+- [Tests & Migrations](#-tests--migrations)
+- [CI/CD](#-cicd)
+- [Configuration & Secrets](#-configuration--secrets)
+- [Remote Automation Checklist](#-remote-automation-checklist)
+- [Project Coverage](#-project-coverage)
+- [License](#-license)
+
+---
+
+## 🚀 What This Is
+
+This project packages a churn prediction workflow into a full **MLOps system**, not just a notebook or a dashboard:
+
+| Component | Role |
+|---|---|
+| 🎛️ **Streamlit app** | Production-style inference UI and operational review |
+| 🐘 **PostgreSQL** | Prediction logs, governance records, monitoring alerts |
+| 📊 **MLflow** | Experiment tracking and monitoring run history |
+| ⚙️ **GitHub Actions** | CI, container delivery, scheduled monitoring & retraining |
+| 🧱 **Alembic** | Reproducible database schema migrations |
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart LR
+    A[Streamlit App] -->|logs predictions| B[(PostgreSQL)]
+    A -->|logs runs| C[MLflow]
+    D[Scripts/run_monitoring.py] --> B
+    D --> C
+    E[Scripts/run_training.py] --> C
+    F[GitHub Actions: CI] --> G[Tests / Lint / Docker Build]
+    H[GitHub Actions: CD] --> I[Container Registry]
+    J[GitHub Actions: Monitoring] --> D
+    K[GitHub Actions: Training] --> E
+    A -.dispatch.-> K
+```
+
+---
+
+## ⚡ Quick Start
+
+The fastest way to run everything locally is Docker Compose:
+
+```bash
 docker compose up --build
 ```
 
-If you want to initialize the database schema explicitly before running the app:
+To initialize the database schema explicitly before running the app:
 
-```powershell
+```bash
 alembic upgrade head
 ```
 
 Then open:
 
-- Streamlit app: `http://localhost:8501`
-- MLflow UI: `http://localhost:5000`
+| Service | URL |
+|---|---|
+| 🎛️ Streamlit app | `http://localhost:8501` |
+| 📊 MLflow UI | `http://localhost:5000` |
 
-## Core User Flow
+---
 
-1. Open the `Single Prediction` tab and run a few customer predictions.
-2. Review risk summaries in `Manager Insights`.
-3. Save operational decisions in `Action Center`.
-4. Use `Technical Lab` to compare a candidate model and log it to MLflow.
-5. Open `Monitoring Dashboard` to review live evidence and stored alerts.
+## 🧭 Core User Flow
 
-## Running Monitoring From The Terminal
+1. **Single Prediction** — run predictions for individual customers
+2. **Manager Insights** — review risk summaries
+3. **Action Center** — save operational decisions
+4. **Technical Lab** — compare a candidate model and log it to MLflow
+5. **Monitoring Dashboard** — review live evidence and stored alerts
 
-The monitoring script can be run manually or on a scheduler without opening Streamlit:
+---
 
-```powershell
+## 🖥️ Terminal Usage
+
+**Monitoring** — can run manually or on a scheduler without opening Streamlit:
+
+```bash
 python Scripts/run_monitoring.py
-```
-
-Useful options:
-
-```powershell
 python Scripts/run_monitoring.py --days 14
 python Scripts/run_monitoring.py --skip-mlflow-logging
 python Scripts/run_monitoring.py --threshold 2 --fail-on-high-alerts
 ```
 
-What it does:
+It reads recent production predictions from PostgreSQL, computes coverage and drift-style alerts, logs runs to MLflow (unless skipped), and reports whether retraining should be considered.
 
-- reads recent production predictions from PostgreSQL
-- computes live coverage and drift-style alerts
-- logs monitoring runs to MLflow unless skipped
-- prints whether retraining should be considered
+**Training** — trigger the end-to-end pipeline directly:
 
-## Running Training From The Terminal
-
-You can also trigger the end-to-end training pipeline directly:
-
-```powershell
+```bash
 python Scripts/run_training.py --reason manual_validation
 ```
 
-What it does:
+It loads the churn dataset, trains multiple logistic regression variants, logs experiments to MLflow, saves the best production bundle locally, and attempts MLflow model registration/promotion.
 
-- loads the churn dataset
-- trains multiple logistic regression variants
-- logs experiments to MLflow
-- saves the best production bundle locally
-- attempts MLflow model registration/promotion
+<p align="center">
+  <img src="app_33.png" alt="MLflow run detail showing accuracy, F1, ROC AUC for the production model" width="800">
+  <br>
+  <sub>A production training run logged to MLflow, with metrics tracked for every candidate model</sub>
+</p>
 
-## Tests
+---
 
-Run the lightweight unit suite with:
+## ✅ Tests & Migrations
 
-```powershell
+**Run the unit suite:**
+
+```bash
 python -m unittest discover -s tests -v
 ```
 
-## Migrations
+**Apply database migrations:**
 
-Alembic is included so the PostgreSQL schema can evolve in a reproducible way:
-
-```powershell
+```bash
 alembic upgrade head
 ```
 
 The initial migration creates:
-
 - `prediction_logs`
 - `monitoring_alerts`
 - `governance_decisions`
 
-Schema responsibility is intentionally separated from the app:
+Schema responsibility is intentionally separated from the app — migrations define structure, CI/CD and deployment run them explicitly, and the app uses the schema rather than silently altering it.
 
-- migrations define the database structure
-- CI/CD and deployment startup run those migrations explicitly
-- the application then uses the schema instead of silently changing it on every request
+---
 
-## CI
+## 🔄 CI/CD
 
-GitHub Actions CI is defined in `.github/workflows/ci.yml` and now performs:
+GitHub Actions acts as the control plane for quality, delivery, and operational tasks:
 
-- dependency installation with pip cache
-- Python lint checks for critical import/name errors
-- bytecode compilation checks
-- unit tests with coverage
-- Docker image build validation
+| Workflow | Trigger | Purpose |
+|---|---|---|
+| **CI** | every push / PR | lint, import checks, bytecode compilation, unit tests, Docker build validation |
+| **Training** | weekly schedule or manual dispatch | retrains on clean GitHub runners |
+| **Monitoring** | daily schedule or manual dispatch | evaluates live production evidence, raises retraining signals |
+| **CD** | push to `main`/`master`, tags | builds & publishes the container image, optionally triggers deployment |
 
-## CI/CD 
+This turns a good churn model into an auditable, end-to-end MLOps workflow — tests, packaging, and operational jobs run identically every time, which also makes the project easier to scale to a team setting.
 
-This repository uses GitHub Actions as the control plane for quality, delivery, and operational MLOps tasks.
+<p align="center">
+  <img src="app_37.png" alt="MLflow monitoring run showing live drift alerts (accuracy drop, high-risk increase)" width="800">
+  <br>
+  <sub>A scheduled monitoring run detecting real drift — accuracy drop and high-risk-rate increase alerts, logged automatically</sub>
+</p>
 
-How the integration works:
+---
 
-- `CI` runs on every push and pull request to catch Python errors, broken imports, failing tests, and Docker build regressions before code is merged.
-- `Training` can run on a weekly schedule or be launched on demand with `workflow_dispatch`, so retraining happens on clean GitHub runners instead of a developer machine.
-- `Monitoring` can run every day on a schedule or be launched on demand from GitHub to evaluate live production evidence and raise retraining signals in a traceable way.
-- `CD` builds and publishes the container image so the deployed app matches a reviewed Git commit and an auditable automation trail.
+## 🔐 Configuration & Secrets
 
-Why this matters:
+To activate full automation, configure these as GitHub repository/environment secrets:
 
-- it shows that the project is not only a model notebook or dashboard, but a managed ML system with controls around quality, reproducibility, and release
-- it separates development, validation, deployment, and operations into explicit stages that can be demonstrated independently
-- it reduces manual risk because tests, packaging, and operational jobs run the same way every time
-- it improves auditability because retraining and monitoring actions are logged through the same automation layer as code changes
-- it makes the project easier to scale to a team setting because the process does not depend on hidden local steps
+```
+MLFLOW_TRACKING_URI
+MLFLOW_EXPERIMENT_NAME
+DATABASE_URL              # or the individual POSTGRES_* secrets below
+POSTGRES_HOST
+POSTGRES_PORT
+POSTGRES_DB
+POSTGRES_USER
+POSTGRES_PASSWORD
+DEPLOY_WEBHOOK_URL         # optional, for deployment triggering
+```
 
-In short, the CI/CD layer is the bridge between the model and real production practice: it turns a good churn model into an end-to-end MLOps workflow.
+> 💡 `DATABASE_URL` is the simplest option for remote monitoring workflows — it avoids splitting the connection across multiple secrets.
 
-## CD And Automation
+**Streamlit → CI/CD retraining:** the Monitoring Dashboard can dispatch the GitHub `Training` workflow directly. Enable it with:
 
-Additional GitHub Actions workflows are included:
+```
+GITHUB_ACTIONS_TOKEN
+GITHUB_REPOSITORY
+GITHUB_TRAINING_WORKFLOW     # e.g. training.yml
+GITHUB_MONITORING_WORKFLOW   # e.g. monitoring.yml
+GITHUB_WORKFLOW_REF          # e.g. main
+```
 
-- `.github/workflows/cd.yml`
-  Builds and pushes a Docker image to GitHub Container Registry on `main`/`master` and tags. If `DEPLOY_WEBHOOK_URL` is configured as a GitHub secret, it also triggers deployment automatically.
-- `.github/workflows/monitoring.yml`
-  Runs the monitoring cycle daily on GitHub Actions and also supports manual dispatch against externally reachable PostgreSQL and MLflow services. When high-severity alerts are detected, it can launch remote retraining on GitHub runners automatically.
-- `.github/workflows/training.yml`
-  Runs retraining weekly on GitHub Actions and also supports manual dispatch against an externally reachable MLflow service.
+> ⚠️ The workflow ref must point to a branch/tag where these workflow files are already pushed. A `HTTP 422 — Unexpected inputs provided` response usually means the target ref is still serving an older workflow definition.
 
-## Required GitHub Secrets
+---
 
-To activate the full MLOps automation on GitHub, configure these repository or environment secrets:
+## ☁️ Remote Automation Checklist
 
-- `MLFLOW_TRACKING_URI`
-- `MLFLOW_EXPERIMENT_NAME`
-- `DATABASE_URL` or the separate PostgreSQL secrets below
-- `POSTGRES_HOST`
-- `POSTGRES_PORT`
-- `POSTGRES_DB`
-- `POSTGRES_USER`
-- `POSTGRES_PASSWORD`
-- `DEPLOY_WEBHOOK_URL` for optional deployment triggering
+`Training` and `Monitoring` workflows run on GitHub-hosted runners, so local addresses like `localhost:5000` or `db` won't be reachable. To go fully remote:
 
-Using `DATABASE_URL` is the simplest option for remote monitoring workflows because it avoids splitting the PostgreSQL connection across multiple secrets.
+- [ ] Host PostgreSQL somewhere reachable from GitHub Actions
+- [ ] Host MLflow somewhere reachable from GitHub Actions
+- [ ] Set the secrets listed [above](#-configuration--secrets)
+- [ ] Configure the Streamlit app with the `GITHUB_*` variables and `AUTOMATION_EXECUTION_MODE=github`
+- [ ] Trigger one manual `Training` run and one manual `Monitoring` run to validate connectivity
 
-## Streamlit-To-CI/CD Retraining
+The workflows fail early with explicit reachability checks for MLflow and PostgreSQL, which makes debugging a remote setup faster.
 
-The Monitoring Dashboard can also dispatch the GitHub `Training` workflow directly instead of retraining only inside the local app container.
+---
 
-To enable that path, provide these runtime environment variables to the Streamlit app:
+## 📦 Project Coverage
 
-- `GITHUB_ACTIONS_TOKEN`
-- `GITHUB_REPOSITORY`
-- `GITHUB_TRAINING_WORKFLOW` such as `training.yml`
-- `GITHUB_MONITORING_WORKFLOW` such as `monitoring.yml`
-- `GITHUB_WORKFLOW_REF` such as `main`
+This repo covers the main blocks expected in a complete, production-grade MLOps project:
 
-The workflow ref must point to a branch or tag where those workflow files are already pushed with the expected `workflow_dispatch` inputs. If GitHub responds with `HTTP 422` and `Unexpected inputs provided`, the target ref is usually still serving an older workflow definition.
+- ✅ Data-driven model training & experiment tracking
+- ✅ Production inference & prediction logging
+- ✅ Governance decision logging
+- ✅ Monitoring & retraining signals
+- ✅ Schema migrations
+- ✅ CI quality gates
+- ✅ CD-ready container publishing
+- ✅ Scheduled operational automation
 
-When those values are configured, the app can trigger `workflow_dispatch` on the GitHub training pipeline and pass both the retraining reason and the selected training profile.
+---
 
-This is useful when you want retraining to happen through the same CI/CD control plane that handles auditability, centralized logs, runner isolation, and release automation.
+## 📄 License
 
-## Important Note About GitHub-Run Training And Monitoring
+This project is available under the MIT License — see `LICENSE` for details.
 
-The `Training` and `Monitoring` workflows are designed to run on GitHub-hosted runners.
+<div align="center">
 
-- They require your MLflow and PostgreSQL services to be reachable from GitHub Actions.
-- Local Docker addresses such as `http://localhost:5000` or `db` will not work from GitHub-hosted runners.
-- If your services are local-only, GitHub automation cannot reach them until you move them to an externally reachable environment.
+Made with ☕ and a lot of `docker compose up --build`
 
-## Full Remote Automation Checklist
-
-To make retraining and monitoring fully remote instead of local:
-
-1. Host PostgreSQL on a service reachable from GitHub Actions.
-2. Host MLflow on a service reachable from GitHub Actions.
-3. Set GitHub repository secrets for:
-   - `MLFLOW_TRACKING_URI`
-   - `MLFLOW_EXPERIMENT_NAME`
-   - `DATABASE_URL` or `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD`
-4. Keep the Streamlit app configured with:
-   - `GITHUB_ACTIONS_TOKEN`
-   - `GITHUB_REPOSITORY`
-   - `GITHUB_TRAINING_WORKFLOW`
-   - `GITHUB_MONITORING_WORKFLOW`
-   - `GITHUB_WORKFLOW_REF`
-   - `AUTOMATION_EXECUTION_MODE=github`
-5. Trigger one manual GitHub training run and one manual GitHub monitoring run to validate connectivity before relying on the schedules.
-
-The updated workflows now fail early with explicit reachability checks for MLflow and PostgreSQL, which makes remote setup debugging much faster.
-
-## Project MLOps Coverage
-
-This repository now covers the main blocks expected in a complete PFE-style MLOps project:
-
-- data-driven model training and experiment tracking
-- production inference and prediction logging
-- governance decision logging
-- monitoring and retraining signals
-- schema migrations
-- CI quality gates
-- CD-ready container publishing
-- scheduled operational automation
+</div>
